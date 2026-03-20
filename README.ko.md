@@ -36,7 +36,7 @@ OAuth 토큰을 Claude Desktop의 암호화 저장소에서 추출합니다. mac
 claude-rate-limit extract-token
 ```
 
-이 명령은 `~/.claude/.credentials.json` (chmod 600)에 토큰을 저장합니다.
+이 명령은 `~/.claude/.credentials.json`에 토큰을 원자적으로 저장하며, 파일 권한은 `0600`(소유자만 읽기/쓰기)입니다.
 
 ## 사용법
 
@@ -95,13 +95,13 @@ claude-rate-limit extract-token
 
 ## 보안
 
-**안전한 이유:**
+**상대적으로 안전한 이유:**
 
-- **외부 전송 없음** — 바이너리는 `api.anthropic.com`하고만 통신합니다. 제3자 서버, 텔레메트리, 분석 없음. `src/main.rs` 단일 파일을 감사해서 확인할 수 있습니다.
-- **토큰은 로컬에만 저장** — `~/.claude/.credentials.json`은 chmod 600(소유자만 읽기/쓰기)으로 저장. `~/.ssh/id_rsa`와 동일한 보안 모델.
+- **애플리케이션 레벨 네트워크 범위가 좁음** — 애플리케이션 코드가 보내는 API 요청 대상은 `api.anthropic.com`이며, 별도의 텔레메트리, 분석, 제3자 서버 호출 코드는 포함하지 않습니다.
+- **토큰은 로컬에만 저장** — `~/.claude/.credentials.json`은 원자적으로 기록되며 파일 권한은 `0600`(소유자만 읽기/쓰기)입니다.
 - **최소 API 호출** — Haiku 1토큰 요청으로 응답 헤더만 읽음. 응답 본문은 사용하지 않음.
-- **런타임 의존성 없음** — 단일 정적 링크 바이너리. Python, Node.js, 셸 스크립트 없이 변조 가능성 최소화.
-- **완전 감사 가능** — 도구 전체가 Rust 소스 1개 파일(테스트 포함 ~700줄). 빌드 타임 코드 생성이나 동작을 숨기는 매크로 없음.
+- **런타임 표면이 작음** — 주요 로직은 단일 Rust 바이너리에서 실행되며, `extract-token`은 macOS 기본 제공 `/usr/bin/security`와 CommonCrypto를 사용합니다.
+- **감사 범위가 작음** — 핵심 로직이 `src/main.rs` 한 파일에 집중되어 있고, 빌드 타임 코드 생성이나 백그라운드 서비스는 없습니다.
 - **Claude 설정 변경 없음** — 바이너리는 Claude Desktop/Code 설정을 절대 수정하지 않음. `extract-token`은 Claude 설정을 읽기만 하고 자체 인증 파일에만 씀.
 
 ## 토큰 추출의 안정성에 대하여

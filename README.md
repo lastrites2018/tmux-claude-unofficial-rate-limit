@@ -36,7 +36,7 @@ Extract the OAuth token from Claude Desktop's encrypted storage. When the macOS 
 claude-rate-limit extract-token
 ```
 
-This saves the token to `~/.claude/.credentials.json` (chmod 600).
+This writes the token atomically to `~/.claude/.credentials.json` with owner-only permissions (`0600`).
 
 ## Usage
 
@@ -95,13 +95,13 @@ claude-rate-limit extract-token
 
 ## Security
 
-**Why this is safe:**
+**Why this is relatively safe:**
 
-- **No network exfiltration** — the binary only communicates with `api.anthropic.com`. No third-party servers, no telemetry, no analytics. You can verify this by auditing the single `src/main.rs` file.
-- **Token stays local** — `~/.claude/.credentials.json` is stored with chmod 600 (owner-only read/write), the same security model as `~/.ssh/id_rsa`.
+- **Application network traffic is narrow** — the application code sends its API request to `api.anthropic.com` and does not contain telemetry, analytics, or other application-level network destinations.
+- **Token stays local** — `~/.claude/.credentials.json` is written atomically with owner-only permissions (`0600`).
 - **Minimal API surface** — the API call sends a 1-token Haiku request solely to read response headers. The response body is discarded.
-- **No runtime dependencies** — single statically-linked binary. No Python, Node.js, or shell scripts that could be tampered with.
-- **Fully auditable** — the entire tool is one Rust source file (~700 lines including tests). No build-time code generation, no macros that hide behavior.
+- **Small runtime surface** — the main logic runs in a single Rust binary. `extract-token` also invokes macOS's built-in `/usr/bin/security` and CommonCrypto.
+- **Auditable implementation** — the core logic is concentrated in a single `src/main.rs` file, without build-time code generation or hidden background services.
 - **No write access to Claude config** — the binary never modifies Claude Desktop or Claude Code configuration. `extract-token` only reads from Claude's config and writes to its own credential file.
 
 ## Stability of Token Extraction

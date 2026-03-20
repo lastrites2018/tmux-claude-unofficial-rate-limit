@@ -1,20 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL: u64 = 900; // 15분
 
-fn home() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default())
+fn home() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .ok_or("HOME is not set".into())
 }
-fn credentials_path() -> PathBuf { home().join(".claude/.credentials.json") }
-fn cache_path() -> PathBuf { home().join(".claude/rate-limit-cache.json") }
-fn lock_path() -> PathBuf { home().join(".claude/rate-limit.lock") }
-fn claude_config_path() -> PathBuf { home().join("Library/Application Support/Claude/config.json") }
+fn credentials_path() -> Result<PathBuf, String> {
+    Ok(home()?.join(".claude/.credentials.json"))
+}
+fn cache_path() -> Result<PathBuf, String> {
+    Ok(home()?.join(".claude/rate-limit-cache.json"))
+}
+fn lock_path() -> Result<PathBuf, String> {
+    Ok(home()?.join(".claude/rate-limit.lock"))
+}
+fn claude_config_path() -> Result<PathBuf, String> {
+    Ok(home()?.join("Library/Application Support/Claude/config.json"))
+}
 
 #[derive(Deserialize)]
 struct Credentials {
@@ -36,11 +49,15 @@ struct Cache {
 }
 
 fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
 }
 
 fn get_token() -> Option<String> {
-    let s = fs::read_to_string(credentials_path()).ok()?;
+    let path = credentials_path().ok()?;
+    let s = fs::read_to_string(path).ok()?;
     let c: Credentials = serde_json::from_str(&s).ok()?;
     c.oauth?.access_token
 }
@@ -55,21 +72,57 @@ fn load_cache_from(path: &PathBuf, respect_ttl: bool, now_ts: f64) -> Option<Cac
 }
 
 fn load_cache(respect_ttl: bool) -> Option<Cache> {
-    load_cache_from(&cache_path(), respect_ttl, now())
+    let path = cache_path().ok()?;
+    load_cache_from(&path, respect_ttl, now())
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let suffix = format!("tmp.{}", std::process::id());
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => path.with_extension(format!("{ext}.{suffix}")),
+        None => path.with_extension(suffix),
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create parent dir: {e}"))?;
+    }
+
+    let tmp = temp_path(path);
+    let _ = fs::remove_file(&tmp);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .map_err(|e| format!("open temp file: {e}"))?;
+
+    if let Err(e) = file.write_all(bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write temp file: {e}"));
+    }
+
+    drop(file);
+
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })?;
+
+    Ok(())
 }
 
 fn save_cache_to(path: &PathBuf, data: &Cache) {
     let json = serde_json::to_string(data).unwrap();
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, &json).is_ok() {
-        if fs::rename(&tmp, path).is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-    }
+    let _ = write_atomic(path, json.as_bytes(), 0o600);
 }
 
 fn save_cache(data: &Cache) {
-    save_cache_to(&cache_path(), data);
+    if let Ok(path) = cache_path() {
+        save_cache_to(&path, data);
+    }
 }
 
 fn fetch(token: &str) -> Result<Cache, String> {
@@ -77,7 +130,8 @@ fn fetch(token: &str) -> Result<Cache, String> {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "."}]
-    })).unwrap();
+    }))
+    .unwrap();
 
     let resp = ureq::post("https://api.anthropic.com/v1/messages")
         .header("Authorization", &format!("Bearer {token}"))
@@ -86,22 +140,29 @@ fn fetch(token: &str) -> Result<Cache, String> {
         .header("Content-Type", "application/json")
         .send(&body)
         .map_err(|e| match &e {
-            ureq::Error::StatusCode(401) =>
-                "token expired — run: claude-rate-limit extract-token".into(),
+            ureq::Error::StatusCode(401) => {
+                "token expired — run: claude-rate-limit extract-token".into()
+            }
             _ => e.to_string(),
         })?;
 
     let hdrs = resp.headers();
     let h = |name: &str| -> f64 {
-        hdrs.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
+        hdrs.get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
     };
 
     Ok(Cache {
         fetched_at: now(),
         util_5h: h("anthropic-ratelimit-unified-5h-utilization"),
         util_1w: h("anthropic-ratelimit-unified-7d-utilization"),
-        reset_5h: hdrs.get("anthropic-ratelimit-unified-5h-reset")
-            .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        reset_5h: hdrs
+            .get("anthropic-ratelimit-unified-5h-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -109,11 +170,16 @@ unsafe extern "C" {
     fn flock(fd: i32, op: i32) -> i32;
     // CommonCrypto AES
     fn CCCrypt(
-        op: u32, alg: u32, options: u32,
-        key: *const u8, key_len: usize,
+        op: u32,
+        alg: u32,
+        options: u32,
+        key: *const u8,
+        key_len: usize,
         iv: *const u8,
-        data_in: *const u8, data_in_len: usize,
-        data_out: *mut u8, data_out_avail: usize,
+        data_in: *const u8,
+        data_in_len: usize,
+        data_out: *mut u8,
+        data_out_avail: usize,
         data_out_moved: *mut usize,
     ) -> i32;
 }
@@ -121,8 +187,15 @@ unsafe extern "C" {
 // === extract-token ===
 
 fn keychain_password() -> Result<String, String> {
-    let out = Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Safe Storage", "-a", "Claude Key", "-w"])
+    let out = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Safe Storage",
+            "-a",
+            "Claude Key",
+            "-w",
+        ])
         .output()
         .map_err(|e| format!("security command failed: {e}"))?;
     if !out.status.success() {
@@ -154,11 +227,16 @@ fn decrypt_safe_storage(encrypted_b64: &str, password: &str) -> Result<Vec<u8>, 
     // kCCDecrypt=1, kCCAlgorithmAES128=0, kCCOptionPKCS7Padding=1
     let status = unsafe {
         CCCrypt(
-            1, 0, 1,
-            key.as_ptr(), key.len(),
+            1,
+            0,
+            1,
+            key.as_ptr(),
+            key.len(),
             iv.as_ptr(),
-            ciphertext.as_ptr(), ciphertext.len(),
-            out.as_mut_ptr(), out.len(),
+            ciphertext.as_ptr(),
+            ciphertext.len(),
+            out.as_mut_ptr(),
+            out.len(),
             &mut out_len,
         )
     };
@@ -183,7 +261,10 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
         }
         let mut ipad = [0x36u8; 64];
         let mut opad = [0x5cu8; 64];
-        for i in 0..64 { ipad[i] ^= k[i]; opad[i] ^= k[i]; }
+        for i in 0..64 {
+            ipad[i] ^= k[i];
+            opad[i] ^= k[i];
+        }
         let mut inner = ipad.to_vec();
         inner.extend_from_slice(msg);
         let inner_hash = sha1(&inner);
@@ -202,16 +283,23 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
         let bit_len = (data.len() as u64) * 8;
         let mut msg = data.to_vec();
         msg.push(0x80);
-        while msg.len() % 64 != 56 { msg.push(0); }
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
         msg.extend_from_slice(&bit_len.to_be_bytes());
 
         for chunk in msg.chunks(64) {
             let mut w = [0u32; 80];
             for i in 0..16 {
-                w[i] = u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]);
+                w[i] = u32::from_be_bytes([
+                    chunk[i * 4],
+                    chunk[i * 4 + 1],
+                    chunk[i * 4 + 2],
+                    chunk[i * 4 + 3],
+                ]);
             }
             for i in 16..80 {
-                w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
             }
             let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
             for i in 0..80 {
@@ -222,9 +310,17 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
                     _ => (b ^ c ^ d, Wrapping(0xCA62C1D6)),
                 };
                 let temp = Wrapping(a.0.rotate_left(5)) + f + e + k + Wrapping(w[i]);
-                e = d; d = c; c = Wrapping(b.0.rotate_left(30)); b = a; a = temp;
+                e = d;
+                d = c;
+                c = Wrapping(b.0.rotate_left(30));
+                b = a;
+                a = temp;
             }
-            h0 = h0 + a; h1 = h1 + b; h2 = h2 + c; h3 = h3 + d; h4 = h4 + e;
+            h0 = h0 + a;
+            h1 = h1 + b;
+            h2 = h2 + c;
+            h3 = h3 + d;
+            h4 = h4 + e;
         }
         let mut r = [0u8; 20];
         r[0..4].copy_from_slice(&h0.0.to_be_bytes());
@@ -242,7 +338,9 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
     let mut result = u;
     for _ in 1..iterations {
         u = hmac_sha1(password, &u);
-        for j in 0..20 { result[j] ^= u[j]; }
+        for j in 0..20 {
+            result[j] ^= u[j];
+        }
     }
     let copy_len = out.len().min(20);
     out[..copy_len].copy_from_slice(&result[..copy_len]);
@@ -251,23 +349,25 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
 fn extract_token() -> Result<(), String> {
     let password = keychain_password()?;
 
-    let config_str = fs::read_to_string(claude_config_path())
-        .map_err(|e| format!("read config.json: {e}"))?;
-    let config: serde_json::Value = serde_json::from_str(&config_str)
-        .map_err(|e| format!("parse config.json: {e}"))?;
+    let config_path = claude_config_path()?;
+    let config_str =
+        fs::read_to_string(config_path).map_err(|e| format!("read config.json: {e}"))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&config_str).map_err(|e| format!("parse config.json: {e}"))?;
 
-    let encrypted = config.get("oauth:tokenCache")
+    let encrypted = config
+        .get("oauth:tokenCache")
         .and_then(|v| v.as_str())
         .ok_or("no oauth:tokenCache in config.json")?;
 
     let decrypted = decrypt_safe_storage(encrypted, &password)?;
-    let decrypted_str = String::from_utf8(decrypted)
-        .map_err(|e| format!("UTF-8 decode: {e}"))?;
+    let decrypted_str = String::from_utf8(decrypted).map_err(|e| format!("UTF-8 decode: {e}"))?;
 
-    let token_data: serde_json::Value = serde_json::from_str(&decrypted_str)
-        .map_err(|e| format!("parse decrypted JSON: {e}"))?;
+    let token_data: serde_json::Value =
+        serde_json::from_str(&decrypted_str).map_err(|e| format!("parse decrypted JSON: {e}"))?;
 
-    let token = token_data.as_object()
+    let token = token_data
+        .as_object()
         .and_then(|obj| {
             obj.values().find_map(|v| {
                 v.as_object()
@@ -279,32 +379,28 @@ fn extract_token() -> Result<(), String> {
         .ok_or("no token found in decrypted data")?;
 
     let creds = serde_json::json!({"claudeAiOauth": {"accessToken": token}});
-    let path = credentials_path();
+    let path = credentials_path()?;
     let json = serde_json::to_string(&creds).unwrap();
 
-    // 원자적 쓰기 + chmod 600
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename: {e}")
-    })?;
+    write_atomic(&path, json.as_bytes(), 0o600)?;
 
     println!("saved to {}", path.display());
     Ok(())
 }
 
 fn fetch_with_lock(token: &str) -> Option<Cache> {
+    let path = lock_path().ok()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+
     let file = fs::OpenOptions::new()
-        .create(true).write(true).truncate(false)
-        .open(lock_path()).ok()?;
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .ok()?;
 
     // LOCK_EX | LOCK_NB = 6
     if unsafe { flock(file.as_raw_fd(), 6) } != 0 {
@@ -312,7 +408,9 @@ fn fetch_with_lock(token: &str) -> Option<Cache> {
     }
 
     // 락 후 캐시 재확인
-    if let Some(c) = load_cache(true) { return Some(c); }
+    if let Some(c) = load_cache(true) {
+        return Some(c);
+    }
 
     let data = fetch(token).ok()?;
     save_cache(&data);
@@ -320,11 +418,19 @@ fn fetch_with_lock(token: &str) -> Option<Cache> {
 }
 
 fn format_reset_at(ts: u64, now_ts: f64) -> String {
-    if ts == 0 { return String::new(); }
+    if ts == 0 {
+        return String::new();
+    }
     let s = ts as i64 - now_ts as i64;
-    if s <= 0 { return String::new(); }
+    if s <= 0 {
+        return String::new();
+    }
     let (h, m) = (s / 3600, (s % 3600) / 60);
-    if h > 0 { format!("{h}h{m:02}m") } else { format!("{m}m") }
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
+    }
 }
 
 fn remaining(util: f64) -> f64 {
@@ -336,10 +442,16 @@ fn format_tmux(d: &Cache, now_ts: f64) -> String {
     let rw = remaining(d.util_1w);
     let reset = format_reset_at(d.reset_5h, now_ts);
     let age = (now_ts - d.fetched_at) as u64;
-    let stale = if age > 120 { format!(" [{}m ago]", age / 60) } else { String::new() };
+    let stale = if age > 120 {
+        format!(" [{}m ago]", age / 60)
+    } else {
+        String::new()
+    };
 
     let mut o = format!("5h:{r5:.0}%");
-    if !reset.is_empty() { o.push_str(&format!("({reset})")); }
+    if !reset.is_empty() {
+        o.push_str(&format!("({reset})"));
+    }
     o.push_str(&format!(" 1w:{rw:.0}%{stale}"));
     o
 }
@@ -349,20 +461,37 @@ fn format_ansi(d: &Cache, now_ts: f64) -> String {
     let rw = remaining(d.util_1w);
     let reset = format_reset_at(d.reset_5h, now_ts);
     let age = (now_ts - d.fetched_at) as u64;
-    let stale = if age > 120 { format!(" [{}m ago]", age / 60) } else { String::new() };
+    let stale = if age > 120 {
+        format!(" [{}m ago]", age / 60)
+    } else {
+        String::new()
+    };
 
-    let (b, s, bd, r) = ("\x1b[38;2;137;180;250m", "\x1b[38;2;88;91;112m", "\x1b[1m", "\x1b[0m");
+    let (b, s, bd, r) = (
+        "\x1b[38;2;137;180;250m",
+        "\x1b[38;2;88;91;112m",
+        "\x1b[1m",
+        "\x1b[0m",
+    );
     let mut o = format!("{b}{bd}5h{r} {}{r5:.0}%{r}", color(r5));
-    if !reset.is_empty() { o.push_str(&format!("{s}({reset}){r}")); }
+    if !reset.is_empty() {
+        o.push_str(&format!("{s}({reset}){r}"));
+    }
     o.push_str(&format!(" {s}·{r} {b}{bd}1w{r} {}{rw:.0}%{r}", color(rw)));
-    if !stale.is_empty() { o.push_str(&format!(" {s}{stale}{r}")); }
+    if !stale.is_empty() {
+        o.push_str(&format!(" {s}{stale}{r}"));
+    }
     o
 }
 
 fn color(rem: f64) -> &'static str {
-    if rem <= 20.0 { "\x1b[38;2;243;139;168m" }
-    else if rem <= 50.0 { "\x1b[38;2;250;179;135m" }
-    else { "\x1b[38;2;166;227;161m" }
+    if rem <= 20.0 {
+        "\x1b[38;2;243;139;168m"
+    } else if rem <= 50.0 {
+        "\x1b[38;2;250;179;135m"
+    } else {
+        "\x1b[38;2;166;227;161m"
+    }
 }
 
 fn main() {
@@ -372,7 +501,10 @@ fn main() {
     if args.iter().any(|a| a == "extract-token") {
         match extract_token() {
             Ok(()) => {}
-            Err(e) => { eprintln!("[err] {e}"); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("[err] {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -380,26 +512,52 @@ fn main() {
     let force = args.iter().any(|a| a == "--refresh");
     let tmux = args.iter().any(|a| a == "tmux");
 
+    if let Err(e) = home() {
+        if tmux {
+            println!("[err]");
+        } else {
+            eprintln!("[err] {e}");
+        }
+        return;
+    }
+
     let mut data = if force { None } else { load_cache(true) };
 
     if data.is_none() {
         let token = match get_token() {
             Some(t) => t,
-            None => { eprintln!("[err] no token"); if tmux { println!("[err]"); } return; }
+            None => {
+                eprintln!("[err] no token");
+                if tmux {
+                    println!("[err]");
+                }
+                return;
+            }
         };
 
         if force {
             match fetch(&token) {
-                Ok(d) => { save_cache(&d); data = Some(d); }
-                Err(_) => { data = load_cache(false); }
+                Ok(d) => {
+                    save_cache(&d);
+                    data = Some(d);
+                }
+                Err(_) => {
+                    data = load_cache(false);
+                }
             }
         } else {
             data = fetch_with_lock(&token);
         }
 
-        if data.is_none() { data = load_cache(false); }
         if data.is_none() {
-            if tmux { println!("[err]"); } else { eprintln!("\x1b[38;2;243;139;168m[err] no data\x1b[0m"); }
+            data = load_cache(false);
+        }
+        if data.is_none() {
+            if tmux {
+                println!("[err]");
+            } else {
+                eprintln!("\x1b[38;2;243;139;168m[err] no data\x1b[0m");
+            }
             return;
         }
     }
@@ -692,7 +850,7 @@ mod tests {
     #[test]
     fn save_cache_no_leftover_tmp() {
         let path = tmp_path("atomic.json");
-        let tmp = path.with_extension("tmp");
+        let tmp = temp_path(&path);
         let data = Cache {
             fetched_at: 1000.0,
             util_5h: 0.1,
@@ -702,6 +860,24 @@ mod tests {
         save_cache_to(&path, &data);
         assert!(path.exists());
         assert!(!tmp.exists());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_cache_sets_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_path("mode.json");
+        let data = Cache {
+            fetched_at: 1000.0,
+            util_5h: 0.1,
+            util_1w: 0.2,
+            reset_5h: 0,
+        };
+        save_cache_to(&path, &data);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = fs::remove_file(&path);
     }
 }
