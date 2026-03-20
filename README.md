@@ -81,9 +81,9 @@ Concurrent calls are serialized with `flock` — only one process makes the API 
 
 | File | Purpose |
 |---|---|
-| `~/.claude/.credentials.json` | OAuth token (chmod 600) |
-| `~/.claude/rate-limit-cache.json` | API response cache |
-| `~/.claude/rate-limit.lock` | Concurrent access lock |
+| `~/.claude/.credentials.json` | OAuth token (atomically written, `0600`) |
+| `~/.claude/rate-limit-cache.json` | API response cache (atomically written, `0600`) |
+| `~/.claude/rate-limit.lock` | Concurrent access lock (`0600`) |
 
 ## Token Expiry
 

@@ -81,9 +81,9 @@ tmux source-file ~/.tmux.conf
 
 | 파일 | 용도 |
 |---|---|
-| `~/.claude/.credentials.json` | OAuth 토큰 (chmod 600) |
-| `~/.claude/rate-limit-cache.json` | API 응답 캐시 |
-| `~/.claude/rate-limit.lock` | 동시 호출 방지 락 |
+| `~/.claude/.credentials.json` | OAuth 토큰 (원자적 기록, `0600`) |
+| `~/.claude/rate-limit-cache.json` | API 응답 캐시 (원자적 기록, `0600`) |
+| `~/.claude/rate-limit.lock` | 동시 호출 방지 락 (`0600`) |
 
 ## 토큰 만료 시
 

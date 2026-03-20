@@ -4,9 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 const CACHE_TTL: u64 = 900; // 15분
 
@@ -57,8 +58,10 @@ fn now() -> f64 {
 
 fn get_token() -> Option<String> {
     let path = credentials_path().ok()?;
-    let s = fs::read_to_string(path).ok()?;
-    let c: Credentials = serde_json::from_str(&s).ok()?;
+    let mut s = fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str(&s).ok();
+    s.zeroize();
+    let c: Credentials = parsed?;
     c.oauth?.access_token
 }
 
@@ -76,53 +79,42 @@ fn load_cache(respect_ttl: bool) -> Option<Cache> {
     load_cache_from(&path, respect_ttl, now())
 }
 
-fn temp_path(path: &Path) -> PathBuf {
-    let suffix = format!("tmp.{}", std::process::id());
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => path.with_extension(format!("{ext}.{suffix}")),
-        None => path.with_extension(suffix),
-    }
-}
+fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
 
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create parent dir: {e}"))?;
-    }
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("create parent dir: {e}"))?;
 
-    let tmp = temp_path(path);
-    let _ = fs::remove_file(&tmp);
+    let mut file = tempfile::Builder::new()
+        .prefix(".rate-limit.")
+        .tempfile_in(parent)
+        .map_err(|e| format!("create temp file: {e}"))?;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .map_err(|e| format!("open temp file: {e}"))?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("set temp permissions: {e}"))?;
 
-    if let Err(e) = file.write_all(bytes) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("write temp file: {e}"));
-    }
+    file.as_file_mut()
+        .write_all(bytes)
+        .map_err(|e| format!("write temp file: {e}"))?;
+    file.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("sync temp file: {e}"))?;
 
-    drop(file);
-
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("rename: {e}")
-    })?;
+    file.persist(path)
+        .map_err(|e| format!("rename: {}", e.error))?;
 
     Ok(())
 }
 
-fn save_cache_to(path: &PathBuf, data: &Cache) {
+fn save_cache_to(path: &PathBuf, data: &Cache) -> Result<(), String> {
     let json = serde_json::to_string(data).unwrap();
-    let _ = write_atomic(path, json.as_bytes(), 0o600);
+    write_atomic(path, json.as_bytes(), 0o600)
 }
 
-fn save_cache(data: &Cache) {
-    if let Ok(path) = cache_path() {
-        save_cache_to(&path, data);
-    }
+fn save_cache(data: &Cache) -> Result<(), String> {
+    let path = cache_path()?;
+    save_cache_to(&path, data)
 }
 
 fn fetch(token: &str) -> Result<Cache, String> {
@@ -187,7 +179,7 @@ unsafe extern "C" {
 // === extract-token ===
 
 fn keychain_password() -> Result<String, String> {
-    let out = Command::new("/usr/bin/security")
+    let mut out = Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-s",
@@ -199,9 +191,29 @@ fn keychain_password() -> Result<String, String> {
         .output()
         .map_err(|e| format!("security command failed: {e}"))?;
     if !out.status.success() {
+        out.stdout.zeroize();
+        out.stderr.zeroize();
         return Err("keychain access denied — run from interactive terminal".into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+
+    let stdout = std::mem::take(&mut out.stdout);
+    out.stderr.zeroize();
+
+    let mut password = match String::from_utf8(stdout) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.utf8_error().to_string();
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            return Err(format!("security output UTF-8 decode: {msg}"));
+        }
+    };
+
+    while matches!(password.chars().last(), Some('\n' | '\r')) {
+        password.pop();
+    }
+
+    Ok(password)
 }
 
 fn decrypt_safe_storage(encrypted_b64: &str, password: &str) -> Result<Vec<u8>, String> {
@@ -240,8 +252,10 @@ fn decrypt_safe_storage(encrypted_b64: &str, password: &str) -> Result<Vec<u8>, 
             &mut out_len,
         )
     };
+    key.zeroize();
 
     if status != 0 {
+        out.zeroize();
         return Err(format!("CCCrypt failed: {status}"));
     }
     out.truncate(out_len);
@@ -347,26 +361,50 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
 }
 
 fn extract_token() -> Result<(), String> {
-    let password = keychain_password()?;
+    let mut password = keychain_password()?;
 
     let config_path = claude_config_path()?;
-    let config_str =
+    let mut config_str =
         fs::read_to_string(config_path).map_err(|e| format!("read config.json: {e}"))?;
-    let config: serde_json::Value =
-        serde_json::from_str(&config_str).map_err(|e| format!("parse config.json: {e}"))?;
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            config_str.zeroize();
+            return Err(format!("parse config.json: {e}"));
+        }
+    };
+    config_str.zeroize();
 
-    let encrypted = config
+    let mut encrypted = config
         .get("oauth:tokenCache")
         .and_then(|v| v.as_str())
+        .map(str::to_owned)
         .ok_or("no oauth:tokenCache in config.json")?;
 
-    let decrypted = decrypt_safe_storage(encrypted, &password)?;
-    let decrypted_str = String::from_utf8(decrypted).map_err(|e| format!("UTF-8 decode: {e}"))?;
+    let decrypted = decrypt_safe_storage(&encrypted, &password);
+    encrypted.zeroize();
+    password.zeroize();
+    let decrypted = decrypted?;
+    let mut decrypted_str = match String::from_utf8(decrypted) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.utf8_error().to_string();
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            return Err(format!("UTF-8 decode: {msg}"));
+        }
+    };
 
-    let token_data: serde_json::Value =
-        serde_json::from_str(&decrypted_str).map_err(|e| format!("parse decrypted JSON: {e}"))?;
+    let token_data: serde_json::Value = match serde_json::from_str(&decrypted_str) {
+        Ok(v) => v,
+        Err(e) => {
+            decrypted_str.zeroize();
+            return Err(format!("parse decrypted JSON: {e}"));
+        }
+    };
+    decrypted_str.zeroize();
 
-    let token = token_data
+    let mut token = token_data
         .as_object()
         .and_then(|obj| {
             obj.values().find_map(|v| {
@@ -378,11 +416,14 @@ fn extract_token() -> Result<(), String> {
         })
         .ok_or("no token found in decrypted data")?;
 
-    let creds = serde_json::json!({"claudeAiOauth": {"accessToken": token}});
+    let creds = serde_json::json!({"claudeAiOauth": {"accessToken": token.as_str()}});
     let path = credentials_path()?;
-    let json = serde_json::to_string(&creds).unwrap();
+    let mut json = serde_json::to_string(&creds).unwrap();
+    token.zeroize();
 
-    write_atomic(&path, json.as_bytes(), 0o600)?;
+    let write_result = write_atomic(&path, json.as_bytes(), 0o600);
+    json.zeroize();
+    write_result?;
 
     println!("saved to {}", path.display());
     Ok(())
@@ -413,7 +454,9 @@ fn fetch_with_lock(token: &str) -> Option<Cache> {
     }
 
     let data = fetch(token).ok()?;
-    save_cache(&data);
+    if let Err(e) = save_cache(&data) {
+        eprintln!("[warn] cache save failed: {e}");
+    }
     Some(data)
 }
 
@@ -524,7 +567,7 @@ fn main() {
     let mut data = if force { None } else { load_cache(true) };
 
     if data.is_none() {
-        let token = match get_token() {
+        let mut token = match get_token() {
             Some(t) => t,
             None => {
                 eprintln!("[err] no token");
@@ -538,7 +581,9 @@ fn main() {
         if force {
             match fetch(&token) {
                 Ok(d) => {
-                    save_cache(&d);
+                    if let Err(e) = save_cache(&d) {
+                        eprintln!("[warn] cache save failed: {e}");
+                    }
                     data = Some(d);
                 }
                 Err(_) => {
@@ -548,6 +593,7 @@ fn main() {
         } else {
             data = fetch_with_lock(&token);
         }
+        token.zeroize();
 
         if data.is_none() {
             data = load_cache(false);
@@ -733,7 +779,7 @@ mod tests {
             util_1w: 0.6,
             reset_5h: 2000,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         let loaded = load_cache_from(&path, false, 1000.0).unwrap();
         assert_eq!(data, loaded);
         let _ = fs::remove_file(&path);
@@ -748,7 +794,7 @@ mod tests {
             util_1w: 0.2,
             reset_5h: 0,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         // 899초 후 → TTL(900) 미만 → 유효
         assert!(load_cache_from(&path, true, 1899.0).is_some());
         let _ = fs::remove_file(&path);
@@ -763,7 +809,7 @@ mod tests {
             util_1w: 0.2,
             reset_5h: 0,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         // 900초 후 → TTL(900) 이상 → 만료
         assert!(load_cache_from(&path, true, 1900.0).is_none());
         let _ = fs::remove_file(&path);
@@ -778,7 +824,7 @@ mod tests {
             util_1w: 0.2,
             reset_5h: 0,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         // 만료여도 respect_ttl=false면 반환
         assert!(load_cache_from(&path, false, 99999.0).is_some());
         let _ = fs::remove_file(&path);
@@ -849,18 +895,25 @@ mod tests {
 
     #[test]
     fn save_cache_no_leftover_tmp() {
-        let path = tmp_path("atomic.json");
-        let tmp = temp_path(&path);
+        let dir = tmp_path("atomic-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atomic.json");
         let data = Cache {
             fetched_at: 1000.0,
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         assert!(path.exists());
-        assert!(!tmp.exists());
+        let leftover = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with(".rate-limit."));
+        assert!(!leftover);
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 
     #[cfg(unix)]
@@ -875,7 +928,7 @@ mod tests {
             util_1w: 0.2,
             reset_5h: 0,
         };
-        save_cache_to(&path, &data);
+        save_cache_to(&path, &data).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = fs::remove_file(&path);
