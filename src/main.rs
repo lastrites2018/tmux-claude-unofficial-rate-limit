@@ -430,6 +430,8 @@ fn extract_token() -> Result<(), String> {
 }
 
 fn fetch_with_lock(token: &str) -> Option<Cache> {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = lock_path().ok()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok()?;
@@ -441,6 +443,9 @@ fn fetch_with_lock(token: &str) -> Option<Cache> {
         .truncate(false)
         .mode(0o600)
         .open(path)
+        .ok()?;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
         .ok()?;
 
     // LOCK_EX | LOCK_NB = 6
