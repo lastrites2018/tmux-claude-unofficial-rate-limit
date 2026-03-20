@@ -19,6 +19,12 @@ Display Claude Max (Pro/Team) subscription rate limit remaining percentage in yo
 - Rust toolchain (for building)
 - tmux (for status bar display)
 
+## FAQ
+
+**Q: Does this work on Pro too?**
+
+**A:** It works on plans that return the rate limit headers. Confirmed on Max; unverified on Pro/Team.
+
 ## Install
 
 ```bash

@@ -19,6 +19,12 @@ Claude Max (Pro/Team) 구독의 rate limit 잔여량을 tmux 상태바에 표시
 - Rust 툴체인 (빌드 시)
 - tmux (상태바 표시 시)
 
+## FAQ
+
+**Q: Pro 플랜에서도 되나요?**
+
+**A:** rate limit 헤더를 반환하는 플랜이면 작동합니다. Max에서 확인됨, Pro/Team은 미확인.
+
 ## 설치
 
 ```bash

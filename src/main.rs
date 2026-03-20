@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
@@ -79,10 +79,10 @@ fn load_cache(respect_ttl: bool) -> Option<Cache> {
     load_cache_from(&path, respect_ttl, now())
 }
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|e| format!("create parent dir: {e}"))?;
 
     let mut file = tempfile::Builder::new()
@@ -107,7 +107,7 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), S
     Ok(())
 }
 
-fn save_cache_to(path: &PathBuf, data: &Cache) -> Result<(), String> {
+fn save_cache_to(path: &Path, data: &Cache) -> Result<(), String> {
     let json = serde_json::to_string(data).unwrap();
     write_atomic(path, json.as_bytes(), 0o600)
 }
@@ -316,25 +316,25 @@ fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
                 w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
             }
             let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-            for i in 0..80 {
+            for (i, wi) in w.iter().enumerate() {
                 let (f, k) = match i {
                     0..=19 => ((b & c) | ((!b) & d), Wrapping(0x5A827999)),
                     20..=39 => (b ^ c ^ d, Wrapping(0x6ED9EBA1)),
                     40..=59 => ((b & c) | (b & d) | (c & d), Wrapping(0x8F1BBCDC)),
                     _ => (b ^ c ^ d, Wrapping(0xCA62C1D6)),
                 };
-                let temp = Wrapping(a.0.rotate_left(5)) + f + e + k + Wrapping(w[i]);
+                let temp = Wrapping(a.0.rotate_left(5)) + f + e + k + Wrapping(*wi);
                 e = d;
                 d = c;
                 c = Wrapping(b.0.rotate_left(30));
                 b = a;
                 a = temp;
             }
-            h0 = h0 + a;
-            h1 = h1 + b;
-            h2 = h2 + c;
-            h3 = h3 + d;
-            h4 = h4 + e;
+            h0 += a;
+            h1 += b;
+            h2 += c;
+            h3 += d;
+            h4 += e;
         }
         let mut r = [0u8; 20];
         r[0..4].copy_from_slice(&h0.0.to_be_bytes());
