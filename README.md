@@ -1,128 +1,144 @@
-# claude-rate-limit
+# tmux-claude-unofficial-rate-limit
 
-Claude Max (Pro/Team) 구독의 rate limit 잔여량을 tmux 상태바에 표시하는 단일 바이너리 도구.
+Display Claude Max (Pro/Team) subscription rate limit remaining percentage in your tmux status bar.
+
+[한국어](README.ko.md)
 
 ```
 5h:77%(4h07m) 1w:40%
 ```
 
-- **5h:77%** — 5시간 윈도우 잔여 77%
-- **(4h07m)** — 리셋까지 남은 시간
-- **1w:40%** — 주간 잔여 40%
+- **5h:77%** — 5-hour window remaining 77%
+- **(4h07m)** — time until reset
+- **1w:40%** — weekly remaining 40%
 
-## 요구사항
+## Requirements
 
-- macOS (CommonCrypto, Keychain 사용)
-- Claude Code 또는 Claude Desktop 로그인 상태
-- Rust 툴체인 (빌드 시)
-- tmux (상태바 표시 시)
+- macOS (uses CommonCrypto, Keychain)
+- Claude Code or Claude Desktop logged in
+- Rust toolchain (for building)
+- tmux (for status bar display)
 
-## 설치
+## Install
 
 ```bash
-git clone <repo-url>
-cd claude-rate-limit
+git clone https://github.com/lastrites2018/tmux-claude-unofficial-rate-limit.git
+cd tmux-claude-unofficial-rate-limit
 cargo build --release
 cp target/release/rate-limit ~/.local/bin/claude-rate-limit
 ```
 
-## 초기 설정
+## Initial Setup
 
-OAuth 토큰을 Claude Desktop의 암호화 저장소에서 추출합니다. macOS 키체인 접근 팝업이 뜨면 **허용**을 누르세요.
+Extract the OAuth token from Claude Desktop's encrypted storage. When the macOS Keychain popup appears, click **Allow**.
 
 ```bash
 claude-rate-limit extract-token
 ```
 
-이 명령은 `~/.claude/.credentials.json` (chmod 600)에 토큰을 저장합니다.
+This saves the token to `~/.claude/.credentials.json` (chmod 600).
 
-## 사용법
+## Usage
 
 ```bash
-# tmux 상태바용 (색상 없음)
+# tmux status bar (no color)
 claude-rate-limit tmux
 
-# 터미널 직접 확인 (ANSI 색상)
+# terminal with ANSI colors
 claude-rate-limit
 
-# 캐시 무시하고 강제 갱신
+# force refresh (ignore cache)
 claude-rate-limit --refresh
 
-# 토큰 추출/갱신
+# extract/refresh token
 claude-rate-limit extract-token
 ```
 
-## tmux 설정
+## tmux Configuration
 
-`~/.tmux.conf`에 추가:
+Add to `~/.tmux.conf`:
 
 ```tmux
 set -g status-right '#(~/.local/bin/claude-rate-limit tmux) | %Y-%m-%d %H:%M '
 ```
 
-리로드:
+Reload:
 
 ```bash
 tmux source-file ~/.tmux.conf
 ```
 
-## 동작 원리
+## How It Works
 
-1. `~/.claude/.credentials.json`에서 OAuth 토큰 읽기
-2. Anthropic API에 최소 요청 (Haiku 1토큰) → 응답 헤더에서 rate limit 파싱
-3. 결과를 `~/.claude/rate-limit-cache.json`에 캐시 (15분 TTL)
-4. 캐시 유효 시 API 호출 없이 즉시 출력
+1. Read OAuth token from `~/.claude/.credentials.json`
+2. Make a minimal API request (Haiku, 1 token) to Anthropic → parse rate limit from response headers
+3. Cache result in `~/.claude/rate-limit-cache.json` (15-min TTL)
+4. If cache is valid, output immediately without API call
 
-동시 호출 시 `flock`으로 1개 프로세스만 API 호출, 나머지는 캐시 사용.
+Concurrent calls are serialized with `flock` — only one process makes the API call, others use cache.
 
-## 파일 목록
+## Files
 
-| 파일 | 용도 |
+| File | Purpose |
 |---|---|
-| `~/.claude/.credentials.json` | OAuth 토큰 (chmod 600) |
-| `~/.claude/rate-limit-cache.json` | API 응답 캐시 |
-| `~/.claude/rate-limit.lock` | 동시 호출 방지 락 |
+| `~/.claude/.credentials.json` | OAuth token (chmod 600) |
+| `~/.claude/rate-limit-cache.json` | API response cache |
+| `~/.claude/rate-limit.lock` | Concurrent access lock |
 
-## 토큰 만료 시
+## Token Expiry
 
-`[err]`가 표시되면 토큰을 재추출하세요:
+If `[err]` appears, re-extract the token:
 
 ```bash
 claude-rate-limit extract-token
 ```
 
-## 보안
+## Security
 
-- OAuth 토큰은 `~/.claude/.credentials.json`에 chmod 600으로 저장 (SSH 키와 동일 수준)
-- Anthropic 공식 API(`api.anthropic.com`)만 호출, 제3자 서버 없음
-- 서드파티 런타임 의존성 없음 (단일 바이너리)
+**Why this is safe:**
 
-## 토큰 추출의 안정성에 대하여
+- **No network exfiltration** — the binary only communicates with `api.anthropic.com`. No third-party servers, no telemetry, no analytics. You can verify this by auditing the single `src/main.rs` file.
+- **Token stays local** — `~/.claude/.credentials.json` is stored with chmod 600 (owner-only read/write), the same security model as `~/.ssh/id_rsa`.
+- **Minimal API surface** — the API call sends a 1-token Haiku request solely to read response headers. The response body is discarded.
+- **No runtime dependencies** — single statically-linked binary. No Python, Node.js, or shell scripts that could be tampered with.
+- **Fully auditable** — the entire tool is one Rust source file (~700 lines including tests). No build-time code generation, no macros that hide behavior.
+- **No write access to Claude config** — the binary never modifies Claude Desktop or Claude Code configuration. `extract-token` only reads from Claude's config and writes to its own credential file.
 
-`extract-token`은 Claude Desktop(Electron 앱)의 내부 저장 방식에 의존합니다.
+## Stability of Token Extraction
 
-**의존하는 비공식 구현 세부사항:**
+`extract-token` depends on Claude Desktop's (Electron app) internal storage implementation.
 
-- Claude Desktop이 `~/Library/Application Support/Claude/config.json`에 `oauth:tokenCache` 키로 암호화된 토큰을 저장한다는 것
-- Electron의 safeStorage가 macOS에서 `v10` 접두사 + AES-128-CBC (PBKDF2-SHA1, salt=`saltysalt`, iterations=1003)를 사용한다는 것
-- macOS Keychain에 `Claude Safe Storage` / `Claude Key`로 암호화 키가 저장된다는 것
+**Unofficial implementation details relied upon:**
 
-**이것이 깨질 수 있는 경우:**
+- Claude Desktop stores an encrypted token at `~/Library/Application Support/Claude/config.json` under the `oauth:tokenCache` key
+- Electron's safeStorage uses `v10` prefix + AES-128-CBC (PBKDF2-SHA1, salt=`saltysalt`, iterations=1003) on macOS
+- The encryption key is stored in macOS Keychain as `Claude Safe Storage` / `Claude Key`
 
-- Claude Desktop 업데이트로 토큰 저장 위치나 키 이름이 변경될 때
-- Electron이 safeStorage 암호화 방식을 변경할 때 (v10 → v11 등)
-- Claude Code가 `.credentials.json`을 공식 지원하여 `extract-token`이 불필요해질 때
+**When this may break:**
 
-**깨지더라도 안전한 이유:**
+- Claude Desktop update changes the token storage location or key name
+- Electron changes the safeStorage encryption scheme (v10 → v11, etc.)
+- Claude Code officially supports `.credentials.json`, making `extract-token` unnecessary
 
-- rate limit 표시 자체(`tmux`/`--refresh`)는 `~/.claude/.credentials.json`만 읽으므로 `extract-token`과 독립적
-- `extract-token`이 실패해도 기존 토큰이 만료되기 전까지는 정상 작동
-- 토큰 파일이 이미 있으면 `extract-token`을 다시 실행할 필요 없음
+**Why breakage is safe:**
 
-## 플랫폼
+- Rate limit display (`tmux`/`--refresh`) only reads `~/.claude/.credentials.json`, independent of `extract-token`
+- If `extract-token` fails, existing token continues to work until it expires
+- No need to re-run `extract-token` if the token file already exists
 
-macOS 전용 (Keychain, CommonCrypto 사용)
+## Platform
 
-## 라이선스
+macOS only (Keychain, CommonCrypto)
+
+## Disclaimer
+
+This is an **unofficial, community-built tool** and is not affiliated with, endorsed by, or supported by Anthropic.
+
+- This tool accesses undocumented internal storage of Claude Desktop (Electron safeStorage). This behavior may break at any time without notice.
+- The OAuth token extracted by `extract-token` grants API access to your Anthropic account. Treat `~/.claude/.credentials.json` with the same care as SSH private keys or API secrets.
+- Use this tool at your own risk. The author assumes no liability for account suspension, token leakage, rate limit miscalculation, unexpected API charges, or any other damages arising from the use of this tool.
+- By using this tool, you accept full responsibility for its operation and any consequences.
+
+## License
 
 MIT
