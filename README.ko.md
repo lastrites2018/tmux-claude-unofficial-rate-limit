@@ -1,6 +1,6 @@
 # tmux-claude-unofficial-rate-limit
 
-Claude Max (Pro/Team) 구독의 rate limit 잔여량을 tmux 상태바에 표시하는 단일 바이너리 도구.
+Claude 구독의 rate limit 잔여량을 tmux, 터미널, 또는 JSON 출력으로 확인하는 단일 바이너리 도구. Max에서 확인됨, Pro/Team은 미확인.
 
 [English](README.md)
 
@@ -34,9 +34,9 @@ cargo build --release
 cp target/release/rate-limit ~/.local/bin/claude-rate-limit
 ```
 
-## 초기 설정
+## 토큰 설정
 
-OAuth 토큰을 Claude Desktop의 암호화 저장소에서 추출합니다. macOS 키체인 접근 팝업이 뜨면 **허용**을 누르세요.
+`~/.claude/.credentials.json`이 이미 있으면 이 단계는 건너뛰어도 됩니다. 없을 때만 Claude Desktop의 암호화 저장소에서 OAuth 토큰을 추출하세요. macOS 키체인 접근 팝업이 뜨면 **허용**을 누르세요.
 
 ```bash
 claude-rate-limit extract-token
@@ -72,7 +72,7 @@ claude-rate-limit --show-reset-dates
 claude-rate-limit extract-token
 ```
 
-`--json`은 `tmux`와 함께 사용할 수 없습니다. `--show-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
+`--json`은 `tmux`와 함께 사용할 수 없습니다. `--refresh`, `--show-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
 
 `--show-reset-dates`를 켜면 5시간 reset은 같은 로컬 날짜 안에서는 기존처럼 상대 시간으로 보이고, 날짜를 넘기면 `M/D H[:MM]` 형식으로 바뀝니다. 1주 reset은 주간 잔여가 30% 이하일 때만 `M/D H[:MM]` 형식으로 표시됩니다. `tmux` 출력에서는 줄 길이를 줄이기 위해 `[Xm ago]`가 보일 때 1주 reset 날짜는 숨깁니다.
 
@@ -107,23 +107,23 @@ tmux source-file ~/.tmux.conf
 | `~/.claude/rate-limit-cache.json` | API 응답 캐시 (원자적 기록, `0600`) |
 | `~/.claude/rate-limit.lock` | 동시 호출 방지 락 (`0600`) |
 
-## 토큰 만료 시
+## 문제 해결
 
-`[err]`가 표시되면 토큰을 재추출하세요:
+표시 모드에서 `[err]`가 보이거나 `--json`이 에러 객체를 반환하면 원인을 먼저 확인하세요:
 
-```bash
-claude-rate-limit extract-token
-```
+- 에러가 토큰 만료 또는 `401`을 가리키면 `claude-rate-limit extract-token`을 다시 실행하세요.
+- `~/.claude/.credentials.json`이 이미 있고 정상이라면 `extract-token`을 다시 실행할 필요는 없습니다.
+- `HOME` 미설정, 토큰 파일 없음, 네트워크 실패, rate-limit 헤더 누락 같은 경우는 환경을 고치거나 나중에 다시 시도해야 합니다.
 
 ## 보안
 
 **상대적으로 안전한 이유:**
 
 - **애플리케이션 레벨 네트워크 범위가 좁음** — 애플리케이션 코드가 보내는 API 요청 대상은 `api.anthropic.com`이며, 별도의 텔레메트리, 분석, 제3자 서버 호출 코드는 포함하지 않습니다.
-- **토큰은 로컬에만 저장** — `~/.claude/.credentials.json`은 원자적으로 기록되며 파일 권한은 `0600`(소유자만 읽기/쓰기)입니다.
+- **토큰은 로컬에 저장됨** — `~/.claude/.credentials.json`은 원자적으로 기록되며 파일 권한은 `0600`(소유자만 읽기/쓰기)입니다. rate limit 조회 시 토큰은 `api.anthropic.com`으로만 전송됩니다.
 - **최소 API 호출** — Haiku 1토큰 요청으로 응답 헤더만 읽음. 응답 본문은 사용하지 않음.
 - **런타임 표면이 작음** — 주요 로직은 단일 Rust 바이너리에서 실행되며, `extract-token`은 macOS 기본 제공 `/usr/bin/security`와 CommonCrypto를 사용합니다.
-- **감사 범위가 작음** — 핵심 로직이 `src/main.rs` 한 파일에 집중되어 있고, 빌드 타임 코드 생성이나 백그라운드 서비스는 없습니다.
+- **감사 범위가 작음** — 핵심 런타임 로직이 `src/main.rs` 한 파일에 집중되어 있고, 별도 커스텀 빌드 스크립트나 숨겨진 백그라운드 서비스는 없습니다.
 - **Claude 설정 변경 없음** — 바이너리는 Claude Desktop/Code 설정을 절대 수정하지 않음. `extract-token`은 Claude 설정을 읽기만 하고 자체 인증 파일에만 씀.
 
 ## 토큰 추출의 안정성에 대하여

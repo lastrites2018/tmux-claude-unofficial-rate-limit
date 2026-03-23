@@ -1,6 +1,6 @@
 # tmux-claude-unofficial-rate-limit
 
-Display Claude Max (Pro/Team) subscription rate limit remaining percentage in your tmux status bar.
+Display Claude subscription rate limit remaining percentage in tmux, terminal, or JSON output. Confirmed on Max; Pro/Team remains unverified.
 
 [한국어](README.ko.md)
 
@@ -34,9 +34,9 @@ cargo build --release
 cp target/release/rate-limit ~/.local/bin/claude-rate-limit
 ```
 
-## Initial Setup
+## Token Setup
 
-Extract the OAuth token from Claude Desktop's encrypted storage. When the macOS Keychain popup appears, click **Allow**.
+If `~/.claude/.credentials.json` already exists, you can skip this step. Otherwise, extract the OAuth token from Claude Desktop's encrypted storage. When the macOS Keychain popup appears, click **Allow**.
 
 ```bash
 claude-rate-limit extract-token
@@ -72,7 +72,7 @@ claude-rate-limit --show-reset-dates
 claude-rate-limit extract-token
 ```
 
-`--json` cannot be combined with `tmux`. `--show-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
+`--json` cannot be combined with `tmux`. `--refresh`, `--show-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
 
 With `--show-reset-dates`, the 5h reset stays relative when it falls on the same local day, but switches to `M/D H[:MM]` when it crosses into another day. The 1w reset date is shown as `M/D H[:MM]` only when weekly remaining is 30% or lower. In `tmux` output, `[Xm ago]` takes priority over the weekly reset date to keep the line short.
 
@@ -107,23 +107,23 @@ Concurrent calls are coordinated with `flock` — one process makes the API call
 | `~/.claude/rate-limit-cache.json` | API response cache (atomically written, `0600`) |
 | `~/.claude/rate-limit.lock` | Concurrent access lock (`0600`) |
 
-## Token Expiry
+## Troubleshooting
 
-If `[err]` appears, re-extract the token:
+If display mode shows `[err]`, or `--json` returns an error object, check the cause first:
 
-```bash
-claude-rate-limit extract-token
-```
+- If the error indicates token expiry or `401`, rerun `claude-rate-limit extract-token`.
+- If `~/.claude/.credentials.json` already exists and still works, you do not need to rerun `extract-token`.
+- Errors such as missing `HOME`, missing token file, network failure, or missing rate-limit headers require fixing the environment or retrying later.
 
 ## Security
 
 **Why this is relatively safe:**
 
 - **Application network traffic is narrow** — the application code sends its API request to `api.anthropic.com` and does not contain telemetry, analytics, or other application-level network destinations.
-- **Token stays local** — `~/.claude/.credentials.json` is written atomically with owner-only permissions (`0600`).
+- **Token is stored locally** — `~/.claude/.credentials.json` is written atomically with owner-only permissions (`0600`). During rate-limit fetches, the token is sent only to `api.anthropic.com`.
 - **Minimal API surface** — the API call sends a 1-token Haiku request solely to read response headers. The response body is discarded.
 - **Small runtime surface** — the main logic runs in a single Rust binary. `extract-token` also invokes macOS's built-in `/usr/bin/security` and CommonCrypto.
-- **Auditable implementation** — the core logic is concentrated in a single `src/main.rs` file, without build-time code generation or hidden background services.
+- **Auditable implementation** — the core runtime logic is concentrated in a single `src/main.rs` file, without a custom build script or hidden background services.
 - **No write access to Claude config** — the binary never modifies Claude Desktop or Claude Code configuration. `extract-token` only reads from Claude's config and writes to its own credential file.
 
 ## Stability of Token Extraction
