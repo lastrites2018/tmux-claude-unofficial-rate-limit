@@ -94,10 +94,10 @@ tmux source-file ~/.tmux.conf
 
 1. Read OAuth token from `~/.claude/.credentials.json`
 2. Make a minimal API request (Haiku, 1 token) to Anthropic → parse rate limit from response headers
-3. Cache result in `~/.claude/rate-limit-cache.json` (15-min TTL)
+3. Cache result in `~/.claude/rate-limit-cache.json` (default 15-min TTL, configurable with `--ttl-minutes 1..60`)
 4. If cache is valid, output immediately without API call
 
-Concurrent calls are serialized with `flock` — only one process makes the API call, others use cache.
+Concurrent calls are coordinated with `flock` — one process makes the API call, while others wait briefly for a fresh cache and use cached data when it becomes available.
 
 ## Files
 

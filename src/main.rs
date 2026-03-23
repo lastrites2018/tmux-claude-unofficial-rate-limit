@@ -281,8 +281,15 @@ fn save_cache(data: &Cache) -> Result<(), String> {
 
 fn parse_required_f64_header(name: &str, value: Option<&str>) -> Result<f64, String> {
     let raw = value.ok_or_else(|| format!("missing rate-limit header: {name}"))?;
-    raw.parse::<f64>()
-        .map_err(|e| format!("invalid rate-limit header {name}: {e}"))
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|e| format!("invalid rate-limit header {name}: {e}"))?;
+    if !parsed.is_finite() {
+        return Err(format!(
+            "invalid rate-limit header {name}: non-finite value"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_optional_u64_header(name: &str, value: Option<&str>) -> Result<u64, String> {
@@ -1374,6 +1381,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("anthropic-ratelimit-unified-5h-utilization"));
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_rejects_nan_utilization() {
+        let err = cache_from_rate_limit_headers(
+            Some("NaN"),
+            Some("0.4"),
+            Some("1234"),
+            Some("4567"),
+            1000.0,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-finite value"));
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_rejects_infinite_utilization() {
+        let err = cache_from_rate_limit_headers(
+            Some("inf"),
+            Some("0.4"),
+            Some("1234"),
+            Some("4567"),
+            1000.0,
+        )
+        .unwrap_err();
+        assert!(err.contains("non-finite value"));
     }
 
     #[test]

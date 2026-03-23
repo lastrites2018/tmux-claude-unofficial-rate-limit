@@ -94,10 +94,10 @@ tmux source-file ~/.tmux.conf
 
 1. `~/.claude/.credentials.json`에서 OAuth 토큰 읽기
 2. Anthropic API에 최소 요청 (Haiku 1토큰) → 응답 헤더에서 rate limit 파싱
-3. 결과를 `~/.claude/rate-limit-cache.json`에 캐시 (15분 TTL)
+3. 결과를 `~/.claude/rate-limit-cache.json`에 캐시 (기본 15분 TTL, `--ttl-minutes 1..60`으로 조정 가능)
 4. 캐시 유효 시 API 호출 없이 즉시 출력
 
-동시 호출 시 `flock`으로 1개 프로세스만 API 호출, 나머지는 캐시 사용.
+동시 호출 시 `flock`으로 1개 프로세스만 API 호출하고, 나머지는 새 캐시가 생기길 잠시 기다린 뒤 사용할 수 있으면 캐시를 사용합니다.
 
 ## 파일 목록
 
