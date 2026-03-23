@@ -34,6 +34,8 @@ cargo build --release
 cp target/release/rate-limit ~/.local/bin/claude-rate-limit
 ```
 
+`~/.local/bin`이 `PATH`에 없으면 해당 경로를 추가하거나, `~/.local/bin/claude-rate-limit`처럼 전체 경로로 실행하세요.
+
 ## 토큰 설정
 
 `~/.claude/.credentials.json`이 이미 있으면 이 단계는 건너뛰어도 됩니다. 없을 때만 Claude Desktop의 암호화 저장소에서 OAuth 토큰을 추출하세요. macOS 키체인 접근 팝업이 뜨면 **허용**을 누르세요.
@@ -43,6 +45,21 @@ claude-rate-limit extract-token
 ```
 
 이 명령은 `~/.claude/.credentials.json`에 토큰을 원자적으로 저장하며, 파일 권한은 `0600`(소유자만 읽기/쓰기)입니다.
+
+## 빠른 시작
+
+대부분은 아래 명령만 알면 바로 사용할 수 있습니다:
+
+```bash
+# 터미널에서 현재 rate limit 확인
+claude-rate-limit
+
+# ~/.claude/.credentials.json 이 아직 없을 때만 실행
+claude-rate-limit extract-token
+
+# tmux 상태바용 출력
+claude-rate-limit tmux
+```
 
 ## 사용법
 

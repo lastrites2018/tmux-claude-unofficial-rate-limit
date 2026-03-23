@@ -34,6 +34,8 @@ cargo build --release
 cp target/release/rate-limit ~/.local/bin/claude-rate-limit
 ```
 
+If `~/.local/bin` is not in your `PATH`, either add it or run the binary with its full path: `~/.local/bin/claude-rate-limit`.
+
 ## Token Setup
 
 If `~/.claude/.credentials.json` already exists, you can skip this step. Otherwise, extract the OAuth token from Claude Desktop's encrypted storage. When the macOS Keychain popup appears, click **Allow**.
@@ -43,6 +45,21 @@ claude-rate-limit extract-token
 ```
 
 This writes the token atomically to `~/.claude/.credentials.json` with owner-only permissions (`0600`).
+
+## Quick Start
+
+Most users only need these commands:
+
+```bash
+# check current rate limit in the terminal
+claude-rate-limit
+
+# only if ~/.claude/.credentials.json does not exist yet
+claude-rate-limit extract-token
+
+# output format for tmux status bar
+claude-rate-limit tmux
+```
 
 ## Usage
 
