@@ -89,7 +89,7 @@ claude-rate-limit --hide-reset-dates
 claude-rate-limit extract-token
 ```
 
-`--json`은 `tmux`와 함께 사용할 수 없습니다. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
+`--json`은 `tmux`나 `extract-token`과 함께 사용할 수 없습니다. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
 
 셸에서 `claude-rate-limit --ttl-minutes 5`를 직접 실행하면 그 1회 실행에만 적용됩니다. `tmux`가 계속 5분 TTL을 쓰게 하려면 `~/.tmux.conf` 안의 실행 명령에도 같은 플래그를 넣어야 합니다.
 

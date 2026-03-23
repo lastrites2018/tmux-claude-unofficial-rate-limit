@@ -89,7 +89,7 @@ claude-rate-limit --hide-reset-dates
 claude-rate-limit extract-token
 ```
 
-`--json` cannot be combined with `tmux`. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
+`--json` cannot be combined with `tmux` or `extract-token`. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
 
 Running `claude-rate-limit --ttl-minutes 5` in a shell only affects that single invocation. If you want `tmux` to keep using a 5-minute TTL, add the flag to the command inside `~/.tmux.conf`.
 
