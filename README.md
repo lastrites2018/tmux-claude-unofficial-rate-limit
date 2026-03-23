@@ -5,11 +5,11 @@ Display Claude subscription rate limit remaining percentage in tmux, terminal, o
 [한국어](README.ko.md)
 
 ```
-5h:77%(4h07m) 1w:40%
+5h:24%(1h18m) 1w:40%
 ```
 
-- **5h:77%** — 5-hour window remaining 77%
-- **(4h07m)** — time until reset
+- **5h:24%** — 5-hour window remaining 24%
+- **(1h18m)** — time until reset
 - **1w:40%** — weekly remaining 40%
 
 ## Requirements
@@ -82,16 +82,16 @@ claude-rate-limit --ttl-minutes 5
 # override HTTP timeout (1..30 seconds, default: 10)
 claude-rate-limit --http-timeout-seconds 3
 
-# show reset dates in human-readable output
-claude-rate-limit --show-reset-dates
+# hide reset hints (enabled by default)
+claude-rate-limit --hide-reset-dates
 
 # extract/refresh token
 claude-rate-limit extract-token
 ```
 
-`--json` cannot be combined with `tmux`. `--refresh`, `--show-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
+`--json` cannot be combined with `tmux`. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
 
-With `--show-reset-dates`, the 5h reset stays relative when it falls on the same local day, but switches to `M/D H[:MM]` when it crosses into another day. The 1w reset date is shown as `M/D H[:MM]` only when weekly remaining is 30% or lower. In `tmux` output, `[Xm ago]` takes priority over the weekly reset date to keep the line short.
+Reset hints are enabled by default, but they only appear when remaining is 30% or lower. For 5h, same-day resets stay relative, but cross-day resets switch to `M/D H[:MM]`. For 1w, the reset date is shown as `M/D H[:MM]`. Use `--hide-reset-dates` to suppress these hints. In `tmux` output, `[Xm ago]` takes priority over the weekly reset date to keep the line short.
 
 ## tmux Configuration
 
@@ -161,9 +161,9 @@ If display mode shows `[err]`, or `--json` returns an error object, check the ca
 
 **Why breakage is safe:**
 
-- Rate limit display (`tmux`/`--refresh`) only reads `~/.claude/.credentials.json`, independent of `extract-token`
+- Display commands only read `~/.claude/.credentials.json`, independent of `extract-token`
 - If `extract-token` fails, existing token continues to work until it expires
-- No need to re-run `extract-token` if the token file already exists
+- No need to re-run `extract-token` if the token file already exists and the token is still valid
 
 ## Platform
 

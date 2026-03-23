@@ -19,7 +19,7 @@ const MIN_HTTP_TIMEOUT_SECONDS: u64 = 1;
 const MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const LOCK_RETRY_INTERVAL_MS: u64 = 200;
 const LOCK_RETRY_ATTEMPTS: u32 = 15; // 약 3초
-const WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT: u64 = 30;
+const RESET_DISPLAY_THRESHOLD_PERCENT: u64 = 30;
 
 fn home() -> Result<PathBuf, String> {
     env::var_os("HOME")
@@ -134,7 +134,7 @@ fn parse_cli_from(args: Vec<OsString>) -> Result<Cli, String> {
     let mut pargs = Arguments::from_vec(args);
     let force_refresh = pargs.contains("--refresh");
     let json = pargs.contains("--json");
-    let show_reset_dates = pargs.contains("--show-reset-dates");
+    let hide_reset_dates = pargs.contains("--hide-reset-dates");
     let ttl_minutes_arg: Option<u64> = pargs
         .opt_value_from_str("--ttl-minutes")
         .map_err(|e| e.to_string())?;
@@ -185,12 +185,14 @@ fn parse_cli_from(args: Vec<OsString>) -> Result<Cli, String> {
 
     if command == CommandMode::ExtractToken
         && (force_refresh
-            || show_reset_dates
+            || hide_reset_dates
             || ttl_minutes_arg.is_some()
             || http_timeout_seconds_arg.is_some())
     {
         return Err("extract-token does not accept display/runtime options".into());
     }
+
+    let show_reset_dates = !hide_reset_dates;
 
     Ok(Cli {
         command,
@@ -788,19 +790,24 @@ fn rounded_percent(percent: f64) -> u64 {
     format!("{percent:.0}").parse().unwrap_or_default()
 }
 
-fn should_show_weekly_reset(
-    remaining_1w_percent: f64,
-    reset_1w: u64,
-    show_reset_dates: bool,
-) -> bool {
+fn should_show_reset(remaining_percent: f64, reset_at: u64, show_reset_dates: bool) -> bool {
     show_reset_dates
-        && reset_1w != 0
-        && rounded_percent(remaining_1w_percent) <= WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT
+        && reset_at != 0
+        && rounded_percent(remaining_percent) <= RESET_DISPLAY_THRESHOLD_PERCENT
 }
 
-fn format_5h_reset_display(reset_5h: u64, now_ts: f64, show_reset_dates: bool) -> String {
+fn format_5h_reset_display(
+    remaining_5h_percent: f64,
+    reset_5h: u64,
+    now_ts: f64,
+    show_reset_dates: bool,
+) -> String {
+    if !should_show_reset(remaining_5h_percent, reset_5h, show_reset_dates) {
+        return String::new();
+    }
+
     let relative = format_reset_at(reset_5h, now_ts);
-    if !show_reset_dates || relative.is_empty() {
+    if relative.is_empty() {
         return relative;
     }
 
@@ -821,7 +828,7 @@ fn format_5h_reset_display(reset_5h: u64, now_ts: f64, show_reset_dates: bool) -
 }
 
 fn format_weekly_reset_suffix(rw: f64, reset_1w: u64, show_reset_dates: bool) -> String {
-    if !should_show_weekly_reset(rw, reset_1w, show_reset_dates) {
+    if !should_show_reset(rw, reset_1w, show_reset_dates) {
         return String::new();
     }
     let absolute = format_absolute_reset(reset_1w);
@@ -835,7 +842,7 @@ fn format_weekly_reset_suffix(rw: f64, reset_1w: u64, show_reset_dates: bool) ->
 fn format_tmux(d: &Cache, now_ts: f64, cache_ttl: Duration, show_reset_dates: bool) -> String {
     let r5 = remaining(d.util_5h);
     let rw = remaining(d.util_1w);
-    let reset = format_5h_reset_display(d.reset_5h, now_ts, show_reset_dates);
+    let reset = format_5h_reset_display(r5, d.reset_5h, now_ts, show_reset_dates);
     let age = cache_age_seconds(d.fetched_at, now_ts);
     let stale = if is_stale(age, cache_ttl) {
         format!(" [{}m ago]", age / 60)
@@ -859,7 +866,7 @@ fn format_tmux(d: &Cache, now_ts: f64, cache_ttl: Duration, show_reset_dates: bo
 fn format_ansi(d: &Cache, now_ts: f64, cache_ttl: Duration, show_reset_dates: bool) -> String {
     let r5 = remaining(d.util_5h);
     let rw = remaining(d.util_1w);
-    let reset = format_5h_reset_display(d.reset_5h, now_ts, show_reset_dates);
+    let reset = format_5h_reset_display(r5, d.reset_5h, now_ts, show_reset_dates);
     let weekly_reset = format_weekly_reset_suffix(rw, d.reset_1w, show_reset_dates);
     let age = cache_age_seconds(d.fetched_at, now_ts);
     let stale = if is_stale(age, cache_ttl) {
@@ -1107,7 +1114,7 @@ mod tests {
         };
         assert_eq!(
             format_tmux(&d, 1000.0, default_cache_ttl(), false),
-            "5h:77%(30m) 1w:40%"
+            "5h:77% 1w:40%"
         );
     }
 
@@ -1169,7 +1176,7 @@ mod tests {
         };
         assert_eq!(
             format_tmux(&d, 1000.0, default_cache_ttl(), false),
-            "5h:0%(10m) 1w:0%"
+            "5h:0% 1w:0%"
         );
     }
 
@@ -1500,15 +1507,27 @@ mod tests {
 
         assert_eq!(cli.command, CommandMode::Show);
         assert_eq!(cli.output_mode, OutputMode::Json);
-        assert!(!cli.show_reset_dates);
+        assert!(cli.show_reset_dates);
         assert_eq!(cli.cache_ttl, Duration::from_secs(5 * 60));
         assert_eq!(cli.http_timeout, Duration::from_secs(9));
     }
 
     #[test]
-    fn parse_cli_accepts_show_reset_dates_flag() {
-        let cli = parse_cli_from(vec![OsString::from("--show-reset-dates")]).unwrap();
+    fn parse_cli_defaults_to_show_reset_dates() {
+        let cli = parse_cli_from(vec![]).unwrap();
         assert!(cli.show_reset_dates);
+    }
+
+    #[test]
+    fn parse_cli_accepts_hide_reset_dates_flag() {
+        let cli = parse_cli_from(vec![OsString::from("--hide-reset-dates")]).unwrap();
+        assert!(!cli.show_reset_dates);
+    }
+
+    #[test]
+    fn parse_cli_rejects_legacy_show_reset_dates_flag() {
+        let err = parse_cli_from(vec![OsString::from("--show-reset-dates")]).unwrap_err();
+        assert!(err.contains("--show-reset-dates"));
     }
 
     #[test]
@@ -1583,6 +1602,16 @@ mod tests {
         let suffix = format_weekly_reset_suffix(30.4, 1774846800, true);
         assert!(suffix.starts_with('('));
         assert!(suffix.ends_with(')'));
+    }
+
+    #[test]
+    fn five_hour_reset_hidden_above_threshold_even_when_enabled() {
+        assert_eq!(format_5h_reset_display(30.6, 2000, 1000.0, true), "");
+    }
+
+    #[test]
+    fn five_hour_reset_shown_at_or_below_threshold() {
+        assert_eq!(format_5h_reset_display(30.0, 1900, 1000.0, true), "15m");
     }
 
     #[test]
