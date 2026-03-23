@@ -91,6 +91,8 @@ claude-rate-limit extract-token
 
 `--json`은 `tmux`와 함께 사용할 수 없습니다. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
 
+셸에서 `claude-rate-limit --ttl-minutes 5`를 직접 실행하면 그 1회 실행에만 적용됩니다. `tmux`가 계속 5분 TTL을 쓰게 하려면 `~/.tmux.conf` 안의 실행 명령에도 같은 플래그를 넣어야 합니다.
+
 reset 힌트는 기본적으로 켜져 있지만, 실제 표시는 잔여가 30% 이하일 때만 나타납니다. 5시간 reset은 같은 로컬 날짜 안에서는 상대 시간으로 보이고, 날짜를 넘기면 `M/D H[:MM]` 형식으로 바뀝니다. 1주 reset은 `M/D H[:MM]` 형식으로 표시됩니다. 이 힌트를 숨기려면 `--hide-reset-dates`를 사용하세요. `tmux` 출력에서는 줄 길이를 줄이기 위해 `[Xm ago]`가 보일 때 1주 reset 날짜는 숨깁니다.
 
 ## tmux 설정
@@ -99,6 +101,12 @@ reset 힌트는 기본적으로 켜져 있지만, 실제 표시는 잔여가 30%
 
 ```tmux
 set -g status-right '#(~/.local/bin/claude-rate-limit tmux) | %Y-%m-%d %H:%M '
+```
+
+`tmux`에서도 5분 TTL을 계속 쓰려면, 아래처럼 `tmux` 명령 안에 `--ttl-minutes 5`를 넣으세요:
+
+```tmux
+set -g status-right '#(~/.local/bin/claude-rate-limit --ttl-minutes 5 tmux) | %Y-%m-%d %H:%M '
 ```
 
 리로드:

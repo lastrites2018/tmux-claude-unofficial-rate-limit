@@ -91,6 +91,8 @@ claude-rate-limit extract-token
 
 `--json` cannot be combined with `tmux`. `--refresh`, `--hide-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
 
+Running `claude-rate-limit --ttl-minutes 5` in a shell only affects that single invocation. If you want `tmux` to keep using a 5-minute TTL, add the flag to the command inside `~/.tmux.conf`.
+
 Reset hints are enabled by default, but they only appear when remaining is 30% or lower. For 5h, same-day resets stay relative, but cross-day resets switch to `M/D H[:MM]`. For 1w, the reset date is shown as `M/D H[:MM]`. Use `--hide-reset-dates` to suppress these hints. In `tmux` output, `[Xm ago]` takes priority over the weekly reset date to keep the line short.
 
 ## tmux Configuration
@@ -99,6 +101,12 @@ Add to `~/.tmux.conf`:
 
 ```tmux
 set -g status-right '#(~/.local/bin/claude-rate-limit tmux) | %Y-%m-%d %H:%M '
+```
+
+To keep `tmux` on a 5-minute cache TTL, put the flag inside the `tmux` command itself:
+
+```tmux
+set -g status-right '#(~/.local/bin/claude-rate-limit --ttl-minutes 5 tmux) | %Y-%m-%d %H:%M '
 ```
 
 Reload:
