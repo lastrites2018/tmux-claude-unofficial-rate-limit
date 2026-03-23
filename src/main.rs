@@ -19,7 +19,7 @@ const MIN_HTTP_TIMEOUT_SECONDS: u64 = 1;
 const MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const LOCK_RETRY_INTERVAL_MS: u64 = 200;
 const LOCK_RETRY_ATTEMPTS: u32 = 15; // 약 3초
-const WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT: f64 = 30.0;
+const WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT: u64 = 30;
 
 fn home() -> Result<PathBuf, String> {
     env::var_os("HOME")
@@ -777,6 +777,10 @@ fn remaining(util: f64) -> f64 {
     (100.0 - util * 100.0).max(0.0)
 }
 
+fn rounded_percent(percent: f64) -> u64 {
+    format!("{percent:.0}").parse().unwrap_or_default()
+}
+
 fn should_show_weekly_reset(
     remaining_1w_percent: f64,
     reset_1w: u64,
@@ -784,7 +788,7 @@ fn should_show_weekly_reset(
 ) -> bool {
     show_reset_dates
         && reset_1w != 0
-        && remaining_1w_percent <= WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT
+        && rounded_percent(remaining_1w_percent) <= WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT
 }
 
 fn format_5h_reset_display(reset_5h: u64, now_ts: f64, show_reset_dates: bool) -> String {
@@ -916,6 +920,13 @@ fn print_show_error(output_mode: OutputMode, message: &str) {
     }
 }
 
+fn show_error_exit_code(output_mode: OutputMode) -> i32 {
+    match output_mode {
+        OutputMode::Tmux => 0,
+        OutputMode::Json | OutputMode::Ansi => 1,
+    }
+}
+
 fn run_show(cli: Cli) -> Result<String, String> {
     home()?;
 
@@ -978,7 +989,13 @@ fn main() {
         }
         CommandMode::Show => match run_show(cli) {
             Ok(output) => println!("{output}"),
-            Err(e) => print_show_error(cli.output_mode, &e),
+            Err(e) => {
+                print_show_error(cli.output_mode, &e);
+                let exit_code = show_error_exit_code(cli.output_mode);
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            }
         },
     }
 }
@@ -1486,6 +1503,13 @@ mod tests {
         assert!(err.contains("extract-token does not accept"));
     }
 
+    #[test]
+    fn show_error_exit_code_is_nonzero_for_scriptable_modes() {
+        assert_eq!(show_error_exit_code(OutputMode::Tmux), 0);
+        assert_eq!(show_error_exit_code(OutputMode::Ansi), 1);
+        assert_eq!(show_error_exit_code(OutputMode::Json), 1);
+    }
+
     // === json output ===
 
     #[test]
@@ -1510,7 +1534,7 @@ mod tests {
 
     #[test]
     fn weekly_reset_suffix_hidden_above_threshold() {
-        assert_eq!(format_weekly_reset_suffix(31.0, 1774846800, true), "");
+        assert_eq!(format_weekly_reset_suffix(30.6, 1774846800, true), "");
     }
 
     #[test]
@@ -1522,8 +1546,23 @@ mod tests {
     }
 
     #[test]
-    fn absolute_reset_omits_minutes_when_zero() {
-        assert_eq!(format_absolute_reset(1774846800), "3/30 14");
+    fn weekly_reset_suffix_uses_displayed_percent_threshold() {
+        let suffix = format_weekly_reset_suffix(30.4, 1774846800, true);
+        assert!(suffix.starts_with('('));
+        assert!(suffix.ends_with(')'));
+    }
+
+    #[test]
+    fn format_month_day_time_omits_minutes_when_zero() {
+        let parts = LocalTimeParts {
+            year: 2026,
+            yday: 88,
+            month: 3,
+            day: 30,
+            hour: 14,
+            minute: 0,
+        };
+        assert_eq!(format_month_day_time(parts), "3/30 14");
     }
 
     #[test]
