@@ -53,12 +53,28 @@ claude-rate-limit tmux
 # terminal with ANSI colors
 claude-rate-limit
 
+# structured output for scripts
+claude-rate-limit --json
+
 # force refresh (ignore cache)
 claude-rate-limit --refresh
+
+# override cache TTL (1..60 minutes, default: 15)
+claude-rate-limit --ttl-minutes 5
+
+# override HTTP timeout (1..30 seconds, default: 10)
+claude-rate-limit --http-timeout-seconds 3
+
+# show reset dates in human-readable output
+claude-rate-limit --show-reset-dates
 
 # extract/refresh token
 claude-rate-limit extract-token
 ```
+
+`--json` cannot be combined with `tmux`. `--show-reset-dates`, `--ttl-minutes`, and `--http-timeout-seconds` apply only to display mode, not `extract-token`.
+
+With `--show-reset-dates`, the 5h reset stays relative when it falls on the same local day, but switches to `M/D H[:MM]` when it crosses into another day. The 1w reset date is shown as `M/D H[:MM]` only when weekly remaining is 30% or lower. In `tmux` output, `[Xm ago]` takes priority over the weekly reset date to keep the line short.
 
 ## tmux Configuration
 

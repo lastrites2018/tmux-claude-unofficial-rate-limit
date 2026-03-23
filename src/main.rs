@@ -1,15 +1,25 @@
+use pico_args::Arguments;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-const CACHE_TTL: u64 = 900; // 15분
+const DEFAULT_CACHE_TTL_MINUTES: u64 = 15;
+const MIN_CACHE_TTL_MINUTES: u64 = 1;
+const MAX_CACHE_TTL_MINUTES: u64 = 60;
+const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 10;
+const MIN_HTTP_TIMEOUT_SECONDS: u64 = 1;
+const MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
+const LOCK_RETRY_INTERVAL_MS: u64 = 200;
+const LOCK_RETRY_ATTEMPTS: u32 = 15; // 약 3초
+const WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT: f64 = 30.0;
 
 fn home() -> Result<PathBuf, String> {
     env::var_os("HOME")
@@ -47,6 +57,153 @@ struct Cache {
     util_5h: f64,
     util_1w: f64,
     reset_5h: u64,
+    reset_1w: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandMode {
+    Show,
+    ExtractToken,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Ansi,
+    Tmux,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cli {
+    command: CommandMode,
+    output_mode: OutputMode,
+    force_refresh: bool,
+    show_reset_dates: bool,
+    cache_ttl: Duration,
+    http_timeout: Duration,
+}
+
+#[derive(Serialize)]
+struct JsonStatus {
+    fetched_at: f64,
+    cache_age_seconds: u64,
+    stale: bool,
+    utilization_5h: f64,
+    utilization_1w: f64,
+    remaining_5h_percent: f64,
+    remaining_1w_percent: f64,
+    reset_5h_unix: u64,
+    reset_5h_in: String,
+    reset_5h_at: String,
+    reset_1w_unix: u64,
+    reset_1w_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalTimeParts {
+    year: i32,
+    yday: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+}
+
+fn format_arg_list(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_bounded_u64(
+    name: &str,
+    value: Option<u64>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let parsed = value.unwrap_or(default);
+    if !(min..=max).contains(&parsed) {
+        return Err(format!("{name} must be in range {min}..={max}"));
+    }
+    Ok(parsed)
+}
+
+fn parse_cli_from(args: Vec<OsString>) -> Result<Cli, String> {
+    let mut pargs = Arguments::from_vec(args);
+    let force_refresh = pargs.contains("--refresh");
+    let json = pargs.contains("--json");
+    let show_reset_dates = pargs.contains("--show-reset-dates");
+    let ttl_minutes_arg: Option<u64> = pargs
+        .opt_value_from_str("--ttl-minutes")
+        .map_err(|e| e.to_string())?;
+    let http_timeout_seconds_arg: Option<u64> = pargs
+        .opt_value_from_str("--http-timeout-seconds")
+        .map_err(|e| e.to_string())?;
+    let subcommand = pargs.subcommand().map_err(|e| e.to_string())?;
+    let remaining = pargs.finish();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "unexpected arguments: {}",
+            format_arg_list(&remaining)
+        ));
+    }
+
+    let cache_ttl_minutes = parse_bounded_u64(
+        "--ttl-minutes",
+        ttl_minutes_arg,
+        DEFAULT_CACHE_TTL_MINUTES,
+        MIN_CACHE_TTL_MINUTES,
+        MAX_CACHE_TTL_MINUTES,
+    )?;
+    let http_timeout_seconds = parse_bounded_u64(
+        "--http-timeout-seconds",
+        http_timeout_seconds_arg,
+        DEFAULT_HTTP_TIMEOUT_SECONDS,
+        MIN_HTTP_TIMEOUT_SECONDS,
+        MAX_HTTP_TIMEOUT_SECONDS,
+    )?;
+
+    let command = match subcommand.as_deref() {
+        Some("extract-token") => CommandMode::ExtractToken,
+        Some("tmux") | None => CommandMode::Show,
+        Some(other) => return Err(format!("unknown command: {other}")),
+    };
+
+    let output_mode = match (subcommand.as_deref(), json) {
+        (Some("extract-token"), false) => OutputMode::Ansi,
+        (Some("extract-token"), true) => {
+            return Err("--json cannot be used with extract-token".into());
+        }
+        (Some("tmux"), false) => OutputMode::Tmux,
+        (Some("tmux"), true) => return Err("--json cannot be used with tmux".into()),
+        (None, true) => OutputMode::Json,
+        (None, false) => OutputMode::Ansi,
+        _ => OutputMode::Ansi,
+    };
+
+    if command == CommandMode::ExtractToken
+        && (force_refresh
+            || show_reset_dates
+            || ttl_minutes_arg.is_some()
+            || http_timeout_seconds_arg.is_some())
+    {
+        return Err("extract-token does not accept display/runtime options".into());
+    }
+
+    Ok(Cli {
+        command,
+        output_mode,
+        force_refresh,
+        show_reset_dates,
+        cache_ttl: Duration::from_secs(cache_ttl_minutes * 60),
+        http_timeout: Duration::from_secs(http_timeout_seconds),
+    })
+}
+
+fn parse_cli() -> Result<Cli, String> {
+    parse_cli_from(env::args_os().skip(1).collect())
 }
 
 fn now() -> f64 {
@@ -65,18 +222,23 @@ fn get_token() -> Option<String> {
     c.oauth?.access_token
 }
 
-fn load_cache_from(path: &PathBuf, respect_ttl: bool, now_ts: f64) -> Option<Cache> {
+fn load_cache_from(
+    path: &Path,
+    respect_ttl: bool,
+    now_ts: f64,
+    cache_ttl: Duration,
+) -> Option<Cache> {
     let s = fs::read_to_string(path).ok()?;
     let c: Cache = serde_json::from_str(&s).ok()?;
-    if respect_ttl && (now_ts - c.fetched_at) >= CACHE_TTL as f64 {
+    if respect_ttl && (now_ts - c.fetched_at) >= cache_ttl.as_secs_f64() {
         return None;
     }
     Some(c)
 }
 
-fn load_cache(respect_ttl: bool) -> Option<Cache> {
+fn load_cache(respect_ttl: bool, cache_ttl: Duration) -> Option<Cache> {
     let path = cache_path().ok()?;
-    load_cache_from(&path, respect_ttl, now())
+    load_cache_from(&path, respect_ttl, now(), cache_ttl)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -117,7 +279,38 @@ fn save_cache(data: &Cache) -> Result<(), String> {
     save_cache_to(&path, data)
 }
 
-fn fetch(token: &str) -> Result<Cache, String> {
+fn parse_required_f64_header(name: &str, value: Option<&str>) -> Result<f64, String> {
+    let raw = value.ok_or_else(|| format!("missing rate-limit header: {name}"))?;
+    raw.parse::<f64>()
+        .map_err(|e| format!("invalid rate-limit header {name}: {e}"))
+}
+
+fn parse_optional_u64_header(name: &str, value: Option<&str>) -> Result<u64, String> {
+    match value {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|e| format!("invalid rate-limit header {name}: {e}")),
+        None => Ok(0),
+    }
+}
+
+fn cache_from_rate_limit_headers(
+    util_5h: Option<&str>,
+    util_1w: Option<&str>,
+    reset_5h: Option<&str>,
+    reset_1w: Option<&str>,
+    fetched_at: f64,
+) -> Result<Cache, String> {
+    Ok(Cache {
+        fetched_at,
+        util_5h: parse_required_f64_header("anthropic-ratelimit-unified-5h-utilization", util_5h)?,
+        util_1w: parse_required_f64_header("anthropic-ratelimit-unified-7d-utilization", util_1w)?,
+        reset_5h: parse_optional_u64_header("anthropic-ratelimit-unified-5h-reset", reset_5h)?,
+        reset_1w: parse_optional_u64_header("anthropic-ratelimit-unified-7d-reset", reset_1w)?,
+    })
+}
+
+fn fetch(token: &str, http_timeout: Duration) -> Result<Cache, String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1,
@@ -125,7 +318,13 @@ fn fetch(token: &str) -> Result<Cache, String> {
     }))
     .unwrap();
 
-    let resp = ureq::post("https://api.anthropic.com/v1/messages")
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(http_timeout))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+
+    let resp = agent
+        .post("https://api.anthropic.com/v1/messages")
         .header("Authorization", &format!("Bearer {token}"))
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
@@ -139,23 +338,17 @@ fn fetch(token: &str) -> Result<Cache, String> {
         })?;
 
     let hdrs = resp.headers();
-    let h = |name: &str| -> f64 {
-        hdrs.get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    };
-
-    Ok(Cache {
-        fetched_at: now(),
-        util_5h: h("anthropic-ratelimit-unified-5h-utilization"),
-        util_1w: h("anthropic-ratelimit-unified-7d-utilization"),
-        reset_5h: hdrs
-            .get("anthropic-ratelimit-unified-5h-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0),
-    })
+    cache_from_rate_limit_headers(
+        hdrs.get("anthropic-ratelimit-unified-5h-utilization")
+            .and_then(|v| v.to_str().ok()),
+        hdrs.get("anthropic-ratelimit-unified-7d-utilization")
+            .and_then(|v| v.to_str().ok()),
+        hdrs.get("anthropic-ratelimit-unified-5h-reset")
+            .and_then(|v| v.to_str().ok()),
+        hdrs.get("anthropic-ratelimit-unified-7d-reset")
+            .and_then(|v| v.to_str().ok()),
+        now(),
+    )
 }
 
 unsafe extern "C" {
@@ -429,11 +622,47 @@ fn extract_token() -> Result<(), String> {
     Ok(())
 }
 
-fn fetch_with_lock(token: &str) -> Option<Cache> {
+enum LockAcquireResult {
+    Acquired,
+    Cache(Cache),
+    TimedOut,
+}
+
+fn wait_for_lock_or_cache<F, C, S>(
+    mut try_lock: F,
+    mut load_cache: C,
+    mut sleep: S,
+) -> LockAcquireResult
+where
+    F: FnMut() -> bool,
+    C: FnMut() -> Option<Cache>,
+    S: FnMut(),
+{
+    for attempt in 0..=LOCK_RETRY_ATTEMPTS {
+        if try_lock() {
+            return LockAcquireResult::Acquired;
+        }
+        if let Some(cache) = load_cache() {
+            return LockAcquireResult::Cache(cache);
+        }
+        if attempt == LOCK_RETRY_ATTEMPTS {
+            return LockAcquireResult::TimedOut;
+        }
+        sleep();
+    }
+    LockAcquireResult::TimedOut
+}
+
+fn fetch_with_lock_at(
+    lock_path: &Path,
+    cache_path: &Path,
+    token: &str,
+    cache_ttl: Duration,
+    http_timeout: Duration,
+) -> Option<Cache> {
     use std::os::unix::fs::PermissionsExt;
 
-    let path = lock_path().ok()?;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).ok()?;
     }
 
@@ -442,27 +671,39 @@ fn fetch_with_lock(token: &str) -> Option<Cache> {
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)
+        .open(lock_path)
         .ok()?;
 
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .ok()?;
 
-    // LOCK_EX | LOCK_NB = 6
-    if unsafe { flock(file.as_raw_fd(), 6) } != 0 {
-        return None;
-    }
+    let lock_result = wait_for_lock_or_cache(
+        || unsafe { flock(file.as_raw_fd(), 6) } == 0,
+        || load_cache_from(cache_path, true, now(), cache_ttl),
+        || std::thread::sleep(Duration::from_millis(LOCK_RETRY_INTERVAL_MS)),
+    );
 
-    // 락 후 캐시 재확인
-    if let Some(c) = load_cache(true) {
-        return Some(c);
-    }
+    match lock_result {
+        LockAcquireResult::Cache(cache) => Some(cache),
+        LockAcquireResult::TimedOut => None,
+        LockAcquireResult::Acquired => {
+            if let Some(cache) = load_cache_from(cache_path, true, now(), cache_ttl) {
+                return Some(cache);
+            }
 
-    let data = fetch(token).ok()?;
-    if let Err(e) = save_cache(&data) {
-        eprintln!("[warn] cache save failed: {e}");
+            let data = fetch(token, http_timeout).ok()?;
+            if let Err(e) = save_cache_to(cache_path, &data) {
+                eprintln!("[warn] cache save failed: {e}");
+            }
+            Some(data)
+        }
     }
-    Some(data)
+}
+
+fn fetch_with_lock(token: &str, cache_ttl: Duration, http_timeout: Duration) -> Option<Cache> {
+    let cache = cache_path().ok()?;
+    let lock = lock_path().ok()?;
+    fetch_with_lock_at(&lock, &cache, token, cache_ttl, http_timeout)
 }
 
 fn format_reset_at(ts: u64, now_ts: f64) -> String {
@@ -481,17 +722,117 @@ fn format_reset_at(ts: u64, now_ts: f64) -> String {
     }
 }
 
+fn local_time_parts(ts: u64) -> Option<LocalTimeParts> {
+    let raw = ts as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let ptr = unsafe { libc::localtime_r(&raw, tm.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let tm = unsafe { tm.assume_init() };
+    Some(LocalTimeParts {
+        year: tm.tm_year + 1900,
+        yday: tm.tm_yday,
+        month: (tm.tm_mon + 1) as u32,
+        day: tm.tm_mday as u32,
+        hour: tm.tm_hour as u32,
+        minute: tm.tm_min as u32,
+    })
+}
+
+fn is_same_local_day(a: LocalTimeParts, b: LocalTimeParts) -> bool {
+    a.year == b.year && a.yday == b.yday
+}
+
+fn format_month_day_time(parts: LocalTimeParts) -> String {
+    if parts.minute == 0 {
+        format!("{}/{} {}", parts.month, parts.day, parts.hour)
+    } else {
+        format!(
+            "{}/{} {}:{:02}",
+            parts.month, parts.day, parts.hour, parts.minute
+        )
+    }
+}
+
+fn format_absolute_reset(ts: u64) -> String {
+    local_time_parts(ts)
+        .map(format_month_day_time)
+        .unwrap_or_default()
+}
+
+fn cache_age_seconds(fetched_at: f64, now_ts: f64) -> u64 {
+    if now_ts <= fetched_at {
+        0
+    } else {
+        (now_ts - fetched_at) as u64
+    }
+}
+
+fn is_stale(age_seconds: u64, cache_ttl: Duration) -> bool {
+    age_seconds >= cache_ttl.as_secs()
+}
+
 fn remaining(util: f64) -> f64 {
     (100.0 - util * 100.0).max(0.0)
 }
 
-fn format_tmux(d: &Cache, now_ts: f64) -> String {
+fn should_show_weekly_reset(
+    remaining_1w_percent: f64,
+    reset_1w: u64,
+    show_reset_dates: bool,
+) -> bool {
+    show_reset_dates
+        && reset_1w != 0
+        && remaining_1w_percent <= WEEKLY_RESET_DISPLAY_THRESHOLD_PERCENT
+}
+
+fn format_5h_reset_display(reset_5h: u64, now_ts: f64, show_reset_dates: bool) -> String {
+    let relative = format_reset_at(reset_5h, now_ts);
+    if !show_reset_dates || relative.is_empty() {
+        return relative;
+    }
+
+    let now_parts = match local_time_parts(now_ts as u64) {
+        Some(parts) => parts,
+        None => return relative,
+    };
+    let reset_parts = match local_time_parts(reset_5h) {
+        Some(parts) => parts,
+        None => return relative,
+    };
+
+    if is_same_local_day(now_parts, reset_parts) {
+        relative
+    } else {
+        format_month_day_time(reset_parts)
+    }
+}
+
+fn format_weekly_reset_suffix(rw: f64, reset_1w: u64, show_reset_dates: bool) -> String {
+    if !should_show_weekly_reset(rw, reset_1w, show_reset_dates) {
+        return String::new();
+    }
+    let absolute = format_absolute_reset(reset_1w);
+    if absolute.is_empty() {
+        String::new()
+    } else {
+        format!("({absolute})")
+    }
+}
+
+fn format_tmux(d: &Cache, now_ts: f64, cache_ttl: Duration, show_reset_dates: bool) -> String {
     let r5 = remaining(d.util_5h);
     let rw = remaining(d.util_1w);
-    let reset = format_reset_at(d.reset_5h, now_ts);
-    let age = (now_ts - d.fetched_at) as u64;
-    let stale = if age > 120 {
+    let reset = format_5h_reset_display(d.reset_5h, now_ts, show_reset_dates);
+    let age = cache_age_seconds(d.fetched_at, now_ts);
+    let stale = if is_stale(age, cache_ttl) {
         format!(" [{}m ago]", age / 60)
+    } else {
+        String::new()
+    };
+    let weekly_reset = if stale.is_empty() {
+        format_weekly_reset_suffix(rw, d.reset_1w, show_reset_dates)
     } else {
         String::new()
     };
@@ -500,16 +841,17 @@ fn format_tmux(d: &Cache, now_ts: f64) -> String {
     if !reset.is_empty() {
         o.push_str(&format!("({reset})"));
     }
-    o.push_str(&format!(" 1w:{rw:.0}%{stale}"));
+    o.push_str(&format!(" 1w:{rw:.0}%{weekly_reset}{stale}"));
     o
 }
 
-fn format_ansi(d: &Cache, now_ts: f64) -> String {
+fn format_ansi(d: &Cache, now_ts: f64, cache_ttl: Duration, show_reset_dates: bool) -> String {
     let r5 = remaining(d.util_5h);
     let rw = remaining(d.util_1w);
-    let reset = format_reset_at(d.reset_5h, now_ts);
-    let age = (now_ts - d.fetched_at) as u64;
-    let stale = if age > 120 {
+    let reset = format_5h_reset_display(d.reset_5h, now_ts, show_reset_dates);
+    let weekly_reset = format_weekly_reset_suffix(rw, d.reset_1w, show_reset_dates);
+    let age = cache_age_seconds(d.fetched_at, now_ts);
+    let stale = if is_stale(age, cache_ttl) {
         format!(" [{}m ago]", age / 60)
     } else {
         String::new()
@@ -526,10 +868,32 @@ fn format_ansi(d: &Cache, now_ts: f64) -> String {
         o.push_str(&format!("{s}({reset}){r}"));
     }
     o.push_str(&format!(" {s}·{r} {b}{bd}1w{r} {}{rw:.0}%{r}", color(rw)));
+    if !weekly_reset.is_empty() {
+        o.push_str(&format!("{s}{weekly_reset}{r}"));
+    }
     if !stale.is_empty() {
         o.push_str(&format!(" {s}{stale}{r}"));
     }
     o
+}
+
+fn format_json(d: &Cache, now_ts: f64, cache_ttl: Duration) -> String {
+    let age = cache_age_seconds(d.fetched_at, now_ts);
+    serde_json::to_string(&JsonStatus {
+        fetched_at: d.fetched_at,
+        cache_age_seconds: age,
+        stale: is_stale(age, cache_ttl),
+        utilization_5h: d.util_5h,
+        utilization_1w: d.util_1w,
+        remaining_5h_percent: remaining(d.util_5h),
+        remaining_1w_percent: remaining(d.util_1w),
+        reset_5h_unix: d.reset_5h,
+        reset_5h_in: format_reset_at(d.reset_5h, now_ts),
+        reset_5h_at: format_absolute_reset(d.reset_5h),
+        reset_1w_unix: d.reset_1w,
+        reset_1w_at: format_absolute_reset(d.reset_1w),
+    })
+    .unwrap()
 }
 
 fn color(rem: f64) -> &'static str {
@@ -542,49 +906,30 @@ fn color(rem: f64) -> &'static str {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    // extract-token subcommand
-    if args.iter().any(|a| a == "extract-token") {
-        match extract_token() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("[err] {e}");
-                std::process::exit(1);
-            }
+fn print_show_error(output_mode: OutputMode, message: &str) {
+    match output_mode {
+        OutputMode::Tmux => println!("[err]"),
+        OutputMode::Json => {
+            println!("{}", serde_json::json!({ "error": message }));
         }
-        return;
+        OutputMode::Ansi => eprintln!("[err] {message}"),
     }
+}
 
-    let force = args.iter().any(|a| a == "--refresh");
-    let tmux = args.iter().any(|a| a == "tmux");
+fn run_show(cli: Cli) -> Result<String, String> {
+    home()?;
 
-    if let Err(e) = home() {
-        if tmux {
-            println!("[err]");
-        } else {
-            eprintln!("[err] {e}");
-        }
-        return;
-    }
-
-    let mut data = if force { None } else { load_cache(true) };
+    let mut data = if cli.force_refresh {
+        None
+    } else {
+        load_cache(true, cli.cache_ttl)
+    };
 
     if data.is_none() {
-        let mut token = match get_token() {
-            Some(t) => t,
-            None => {
-                eprintln!("[err] no token");
-                if tmux {
-                    println!("[err]");
-                }
-                return;
-            }
-        };
+        let mut token = get_token().ok_or_else(|| "no token".to_string())?;
 
-        if force {
-            match fetch(&token) {
+        if cli.force_refresh {
+            match fetch(&token, cli.http_timeout) {
                 Ok(d) => {
                     if let Err(e) = save_cache(&d) {
                         eprintln!("[warn] cache save failed: {e}");
@@ -592,39 +937,61 @@ fn main() {
                     data = Some(d);
                 }
                 Err(_) => {
-                    data = load_cache(false);
+                    data = load_cache(false, cli.cache_ttl);
                 }
             }
         } else {
-            data = fetch_with_lock(&token);
+            data = fetch_with_lock(&token, cli.cache_ttl, cli.http_timeout);
         }
         token.zeroize();
 
         if data.is_none() {
-            data = load_cache(false);
-        }
-        if data.is_none() {
-            if tmux {
-                println!("[err]");
-            } else {
-                eprintln!("\x1b[38;2;243;139;168m[err] no data\x1b[0m");
-            }
-            return;
+            data = load_cache(false, cli.cache_ttl);
         }
     }
 
-    let d = data.unwrap();
+    let data = data.ok_or_else(|| "no data".to_string())?;
     let now_ts = now();
-    if tmux {
-        println!("{}", format_tmux(&d, now_ts));
-    } else {
-        println!("{}", format_ansi(&d, now_ts));
+    let rendered = match cli.output_mode {
+        OutputMode::Tmux => format_tmux(&data, now_ts, cli.cache_ttl, cli.show_reset_dates),
+        OutputMode::Json => format_json(&data, now_ts, cli.cache_ttl),
+        OutputMode::Ansi => format_ansi(&data, now_ts, cli.cache_ttl, cli.show_reset_dates),
+    };
+    Ok(rendered)
+}
+
+fn main() {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("[err] {e}");
+            std::process::exit(2);
+        }
+    };
+
+    match cli.command {
+        CommandMode::ExtractToken => {
+            if let Err(e) = extract_token() {
+                eprintln!("[err] {e}");
+                std::process::exit(1);
+            }
+        }
+        CommandMode::Show => match run_show(cli) {
+            Ok(output) => println!("{output}"),
+            Err(e) => print_show_error(cli.output_mode, &e),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn default_cache_ttl() -> Duration {
+        Duration::from_secs(DEFAULT_CACHE_TTL_MINUTES * 60)
+    }
+
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = env::temp_dir();
         p.push(format!("rate-limit-test-{name}-{}", std::process::id()));
@@ -712,8 +1079,12 @@ mod tests {
             util_5h: 0.23,
             util_1w: 0.6,
             reset_5h: 1000 + 1800, // 30분 후
+            reset_1w: 0,
         };
-        assert_eq!(format_tmux(&d, 1000.0), "5h:77%(30m) 1w:40%");
+        assert_eq!(
+            format_tmux(&d, 1000.0, default_cache_ttl(), false),
+            "5h:77%(30m) 1w:40%"
+        );
     }
 
     #[test]
@@ -723,8 +1094,12 @@ mod tests {
             util_5h: 0.5,
             util_1w: 0.8,
             reset_5h: 0,
+            reset_1w: 0,
         };
-        assert_eq!(format_tmux(&d, 1000.0), "5h:50% 1w:20%");
+        assert_eq!(
+            format_tmux(&d, 1000.0, default_cache_ttl(), false),
+            "5h:50% 1w:20%"
+        );
     }
 
     #[test]
@@ -734,21 +1109,29 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
-        // 5분 후 = 300초
-        assert_eq!(format_tmux(&d, 1300.0), "5h:90% 1w:80% [5m ago]");
+        // 5분 후 = 300초, TTL 2분
+        assert_eq!(
+            format_tmux(&d, 1300.0, Duration::from_secs(120), false),
+            "5h:90% 1w:80% [5m ago]"
+        );
     }
 
     #[test]
-    fn tmux_not_stale_within_2min() {
+    fn tmux_not_stale_within_ttl() {
         let d = Cache {
             fetched_at: 1000.0,
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
-        // 119초 후 → stale 아님
-        assert_eq!(format_tmux(&d, 1119.0), "5h:90% 1w:80%");
+        // 5분 TTL에서 119초 후 → stale 아님
+        assert_eq!(
+            format_tmux(&d, 1119.0, Duration::from_secs(300), false),
+            "5h:90% 1w:80%"
+        );
     }
 
     #[test]
@@ -758,8 +1141,12 @@ mod tests {
             util_5h: 1.2,
             util_1w: 1.5,
             reset_5h: 1000 + 600,
+            reset_1w: 0,
         };
-        assert_eq!(format_tmux(&d, 1000.0), "5h:0%(10m) 1w:0%");
+        assert_eq!(
+            format_tmux(&d, 1000.0, default_cache_ttl(), false),
+            "5h:0%(10m) 1w:0%"
+        );
     }
 
     #[test]
@@ -769,8 +1156,12 @@ mod tests {
             util_5h: 0.3,
             util_1w: 0.4,
             reset_5h: 500, // 과거
+            reset_1w: 0,
         };
-        assert_eq!(format_tmux(&d, 1000.0), "5h:70% 1w:60%");
+        assert_eq!(
+            format_tmux(&d, 1000.0, default_cache_ttl(), false),
+            "5h:70% 1w:60%"
+        );
     }
 
     // === cache round-trip ===
@@ -783,9 +1174,10 @@ mod tests {
             util_5h: 0.23,
             util_1w: 0.6,
             reset_5h: 2000,
+            reset_1w: 3000,
         };
         save_cache_to(&path, &data).unwrap();
-        let loaded = load_cache_from(&path, false, 1000.0).unwrap();
+        let loaded = load_cache_from(&path, false, 1000.0, default_cache_ttl()).unwrap();
         assert_eq!(data, loaded);
         let _ = fs::remove_file(&path);
     }
@@ -798,10 +1190,11 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
         save_cache_to(&path, &data).unwrap();
         // 899초 후 → TTL(900) 미만 → 유효
-        assert!(load_cache_from(&path, true, 1899.0).is_some());
+        assert!(load_cache_from(&path, true, 1899.0, default_cache_ttl()).is_some());
         let _ = fs::remove_file(&path);
     }
 
@@ -813,10 +1206,11 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
         save_cache_to(&path, &data).unwrap();
         // 900초 후 → TTL(900) 이상 → 만료
-        assert!(load_cache_from(&path, true, 1900.0).is_none());
+        assert!(load_cache_from(&path, true, 1900.0, default_cache_ttl()).is_none());
         let _ = fs::remove_file(&path);
     }
 
@@ -828,24 +1222,25 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
         save_cache_to(&path, &data).unwrap();
         // 만료여도 respect_ttl=false면 반환
-        assert!(load_cache_from(&path, false, 99999.0).is_some());
+        assert!(load_cache_from(&path, false, 99999.0, default_cache_ttl()).is_some());
         let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn cache_missing_file() {
         let path = tmp_path("nonexistent.json");
-        assert!(load_cache_from(&path, false, 1000.0).is_none());
+        assert!(load_cache_from(&path, false, 1000.0, default_cache_ttl()).is_none());
     }
 
     #[test]
     fn cache_invalid_json() {
         let path = tmp_path("invalid.json");
         fs::write(&path, "not json").unwrap();
-        assert!(load_cache_from(&path, false, 1000.0).is_none());
+        assert!(load_cache_from(&path, false, 1000.0, default_cache_ttl()).is_none());
         let _ = fs::remove_file(&path);
     }
 
@@ -853,7 +1248,7 @@ mod tests {
     fn cache_partial_json() {
         let path = tmp_path("partial.json");
         fs::write(&path, r#"{"fetched_at": 1000.0}"#).unwrap();
-        assert!(load_cache_from(&path, false, 1000.0).is_none());
+        assert!(load_cache_from(&path, false, 1000.0, default_cache_ttl()).is_none());
         let _ = fs::remove_file(&path);
     }
 
@@ -908,6 +1303,7 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
         save_cache_to(&path, &data).unwrap();
         assert!(path.exists());
@@ -932,10 +1328,216 @@ mod tests {
             util_5h: 0.1,
             util_1w: 0.2,
             reset_5h: 0,
+            reset_1w: 0,
         };
         save_cache_to(&path, &data).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = fs::remove_file(&path);
+    }
+
+    // === rate-limit headers ===
+
+    #[test]
+    fn parse_rate_limit_headers_requires_utilization_headers() {
+        let err =
+            cache_from_rate_limit_headers(None, Some("0.4"), Some("1234"), Some("4567"), 1000.0)
+                .unwrap_err();
+        assert!(err.contains("anthropic-ratelimit-unified-5h-utilization"));
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_rejects_invalid_utilization() {
+        let err = cache_from_rate_limit_headers(
+            Some("abc"),
+            Some("0.4"),
+            Some("1234"),
+            Some("4567"),
+            1000.0,
+        )
+        .unwrap_err();
+        assert!(err.contains("anthropic-ratelimit-unified-5h-utilization"));
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_allows_missing_reset() {
+        let cache =
+            cache_from_rate_limit_headers(Some("0.23"), Some("0.6"), None, None, 1000.0).unwrap();
+        assert_eq!(
+            cache,
+            Cache {
+                fetched_at: 1000.0,
+                util_5h: 0.23,
+                util_1w: 0.6,
+                reset_5h: 0,
+                reset_1w: 0,
+            }
+        );
+    }
+
+    // === lock wait ===
+
+    #[test]
+    fn wait_for_lock_or_cache_returns_cache_after_retry() {
+        let expected = Cache {
+            fetched_at: 1000.0,
+            util_5h: 0.23,
+            util_1w: 0.6,
+            reset_5h: 2000,
+            reset_1w: 3000,
+        };
+        let try_count = Cell::new(0usize);
+        let sleep_count = Cell::new(0usize);
+
+        let result = wait_for_lock_or_cache(
+            || {
+                try_count.set(try_count.get() + 1);
+                false
+            },
+            || {
+                if try_count.get() >= 3 {
+                    Some(expected.clone())
+                } else {
+                    None
+                }
+            },
+            || {
+                sleep_count.set(sleep_count.get() + 1);
+            },
+        );
+
+        match result {
+            LockAcquireResult::Cache(cache) => assert_eq!(cache, expected),
+            _ => panic!("expected cache result"),
+        }
+        assert_eq!(try_count.get(), 3);
+        assert_eq!(sleep_count.get(), 2);
+    }
+
+    #[test]
+    fn wait_for_lock_or_cache_times_out_after_configured_retries() {
+        let try_count = Cell::new(0usize);
+        let sleep_count = Cell::new(0usize);
+
+        let result = wait_for_lock_or_cache(
+            || {
+                try_count.set(try_count.get() + 1);
+                false
+            },
+            || None,
+            || {
+                sleep_count.set(sleep_count.get() + 1);
+            },
+        );
+
+        assert!(matches!(result, LockAcquireResult::TimedOut));
+        assert_eq!(try_count.get(), (LOCK_RETRY_ATTEMPTS + 1) as usize);
+        assert_eq!(sleep_count.get(), LOCK_RETRY_ATTEMPTS as usize);
+    }
+
+    // === cli parsing ===
+
+    #[test]
+    fn parse_cli_accepts_json_and_bounded_options() {
+        let cli = parse_cli_from(vec![
+            OsString::from("--json"),
+            OsString::from("--ttl-minutes"),
+            OsString::from("5"),
+            OsString::from("--http-timeout-seconds"),
+            OsString::from("9"),
+        ])
+        .unwrap();
+
+        assert_eq!(cli.command, CommandMode::Show);
+        assert_eq!(cli.output_mode, OutputMode::Json);
+        assert!(!cli.show_reset_dates);
+        assert_eq!(cli.cache_ttl, Duration::from_secs(5 * 60));
+        assert_eq!(cli.http_timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn parse_cli_accepts_show_reset_dates_flag() {
+        let cli = parse_cli_from(vec![OsString::from("--show-reset-dates")]).unwrap();
+        assert!(cli.show_reset_dates);
+    }
+
+    #[test]
+    fn parse_cli_rejects_json_with_tmux() {
+        let err =
+            parse_cli_from(vec![OsString::from("tmux"), OsString::from("--json")]).unwrap_err();
+        assert!(err.contains("--json cannot be used with tmux"));
+    }
+
+    #[test]
+    fn parse_cli_rejects_out_of_range_ttl() {
+        let err = parse_cli_from(vec![OsString::from("--ttl-minutes"), OsString::from("61")])
+            .unwrap_err();
+        assert!(err.contains("--ttl-minutes"));
+    }
+
+    #[test]
+    fn parse_cli_rejects_runtime_options_for_extract_token() {
+        let err = parse_cli_from(vec![
+            OsString::from("extract-token"),
+            OsString::from("--http-timeout-seconds"),
+            OsString::from("3"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("extract-token does not accept"));
+    }
+
+    // === json output ===
+
+    #[test]
+    fn format_json_includes_structured_fields() {
+        let cache = Cache {
+            fetched_at: 1000.0,
+            util_5h: 0.23,
+            util_1w: 0.6,
+            reset_5h: 2800,
+            reset_1w: 4000,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&format_json(&cache, 1300.0, Duration::from_secs(240))).unwrap();
+
+        assert_eq!(value["cache_age_seconds"], 300);
+        assert_eq!(value["stale"], true);
+        assert_eq!(value["remaining_5h_percent"], 77.0);
+        assert_eq!(value["remaining_1w_percent"], 40.0);
+        assert_eq!(value["reset_5h_in"], "25m");
+        assert_eq!(value["reset_1w_unix"], 4000);
+    }
+
+    #[test]
+    fn weekly_reset_suffix_hidden_above_threshold() {
+        assert_eq!(format_weekly_reset_suffix(31.0, 1774846800, true), "");
+    }
+
+    #[test]
+    fn weekly_reset_suffix_shown_at_or_below_threshold() {
+        let suffix = format_weekly_reset_suffix(30.0, 1774846800, true);
+        assert!(suffix.starts_with('('));
+        assert!(suffix.ends_with(')'));
+        assert!(suffix.contains('/'));
+    }
+
+    #[test]
+    fn absolute_reset_omits_minutes_when_zero() {
+        assert_eq!(format_absolute_reset(1774846800), "3/30 14");
+    }
+
+    #[test]
+    fn tmux_hides_weekly_reset_when_stale_suffix_is_present() {
+        let cache = Cache {
+            fetched_at: 1000.0,
+            util_5h: 0.1,
+            util_1w: 0.8,
+            reset_5h: 0,
+            reset_1w: 1774846800,
+        };
+        assert_eq!(
+            format_tmux(&cache, 1300.0, Duration::from_secs(120), true),
+            "5h:90% 1w:20% [5m ago]"
+        );
     }
 }

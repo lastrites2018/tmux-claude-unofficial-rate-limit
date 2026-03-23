@@ -53,12 +53,28 @@ claude-rate-limit tmux
 # 터미널 직접 확인 (ANSI 색상)
 claude-rate-limit
 
+# 스크립트용 구조화 출력
+claude-rate-limit --json
+
 # 캐시 무시하고 강제 갱신
 claude-rate-limit --refresh
+
+# 캐시 TTL 지정 (1..60분, 기본값: 15)
+claude-rate-limit --ttl-minutes 5
+
+# HTTP 타임아웃 지정 (1..30초, 기본값: 10)
+claude-rate-limit --http-timeout-seconds 3
+
+# reset 시각 표시
+claude-rate-limit --show-reset-dates
 
 # 토큰 추출/갱신
 claude-rate-limit extract-token
 ```
+
+`--json`은 `tmux`와 함께 사용할 수 없습니다. `--show-reset-dates`, `--ttl-minutes`, `--http-timeout-seconds`는 표시 모드에서만 적용되며 `extract-token`에는 사용할 수 없습니다.
+
+`--show-reset-dates`를 켜면 5시간 reset은 같은 로컬 날짜 안에서는 기존처럼 상대 시간으로 보이고, 날짜를 넘기면 `M/D H[:MM]` 형식으로 바뀝니다. 1주 reset은 주간 잔여가 30% 이하일 때만 `M/D H[:MM]` 형식으로 표시됩니다. `tmux` 출력에서는 줄 길이를 줄이기 위해 `[Xm ago]`가 보일 때 1주 reset 날짜는 숨깁니다.
 
 ## tmux 설정
 
