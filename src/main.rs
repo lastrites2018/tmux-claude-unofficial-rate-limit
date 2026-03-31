@@ -668,11 +668,11 @@ fn fetch_with_lock_at(
     token: &str,
     cache_ttl: Duration,
     http_timeout: Duration,
-) -> Option<Cache> {
+) -> Result<Option<Cache>, String> {
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).ok()?;
+        fs::create_dir_all(parent).map_err(|e| format!("create lock dir: {e}"))?;
     }
 
     let file = fs::OpenOptions::new()
@@ -681,10 +681,10 @@ fn fetch_with_lock_at(
         .truncate(false)
         .mode(0o600)
         .open(lock_path)
-        .ok()?;
+        .map_err(|e| format!("open lock file: {e}"))?;
 
     file.set_permissions(fs::Permissions::from_mode(0o600))
-        .ok()?;
+        .map_err(|e| format!("set lock permissions: {e}"))?;
 
     let lock_result = wait_for_lock_or_cache(
         || unsafe { flock(file.as_raw_fd(), 6) } == 0,
@@ -693,25 +693,29 @@ fn fetch_with_lock_at(
     );
 
     match lock_result {
-        LockAcquireResult::Cache(cache) => Some(cache),
-        LockAcquireResult::TimedOut => None,
+        LockAcquireResult::Cache(cache) => Ok(Some(cache)),
+        LockAcquireResult::TimedOut => Ok(None),
         LockAcquireResult::Acquired => {
             if let Some(cache) = load_cache_from(cache_path, true, now(), cache_ttl) {
-                return Some(cache);
+                return Ok(Some(cache));
             }
 
-            let data = fetch(token, http_timeout).ok()?;
+            let data = fetch(token, http_timeout)?;
             if let Err(e) = save_cache_to(cache_path, &data) {
                 eprintln!("[warn] cache save failed: {e}");
             }
-            Some(data)
+            Ok(Some(data))
         }
     }
 }
 
-fn fetch_with_lock(token: &str, cache_ttl: Duration, http_timeout: Duration) -> Option<Cache> {
-    let cache = cache_path().ok()?;
-    let lock = lock_path().ok()?;
+fn fetch_with_lock(
+    token: &str,
+    cache_ttl: Duration,
+    http_timeout: Duration,
+) -> Result<Option<Cache>, String> {
+    let cache = cache_path()?;
+    let lock = lock_path()?;
     fetch_with_lock_at(&lock, &cache, token, cache_ttl, http_timeout)
 }
 
@@ -924,9 +928,67 @@ fn color(rem: f64) -> &'static str {
     }
 }
 
+fn classify_tmux_error(message: &str) -> &'static str {
+    if message == "HOME is not set" {
+        return "home";
+    }
+    if message == "no token" {
+        return "no-token";
+    }
+    if message.starts_with("token expired") {
+        return "expired";
+    }
+    if message.starts_with("missing rate-limit header:")
+        || message.starts_with("invalid rate-limit header")
+    {
+        return "headers";
+    }
+    if message == "no data" {
+        return "no-data";
+    }
+
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.starts_with("http status")
+        || lower.contains("status code")
+        || lower.contains("status:")
+    {
+        "api"
+    } else if lower.contains("transport")
+        || lower.contains("connection")
+        || lower.contains("dns")
+        || lower.contains("tls")
+        || lower.contains("network")
+        || lower.contains("io error")
+    {
+        "network"
+    } else {
+        "err"
+    }
+}
+
+fn format_tmux_error(message: &str) -> String {
+    format!("[{}]", classify_tmux_error(message))
+}
+
+fn finalize_show_data(
+    data: Option<Cache>,
+    stale_cache: Option<Cache>,
+    fetch_error: Option<String>,
+) -> Result<Cache, String> {
+    if let Some(data) = data.or(stale_cache) {
+        Ok(data)
+    } else if let Some(err) = fetch_error {
+        Err(err)
+    } else {
+        Err("no data".to_string())
+    }
+}
+
 fn print_show_error(output_mode: OutputMode, message: &str) {
     match output_mode {
-        OutputMode::Tmux => println!("[err]"),
+        OutputMode::Tmux => println!("{}", format_tmux_error(message)),
         OutputMode::Json => {
             println!("{}", serde_json::json!({ "error": message }));
         }
@@ -944,6 +1006,7 @@ fn show_error_exit_code(output_mode: OutputMode) -> i32 {
 fn run_show(cli: Cli) -> Result<String, String> {
     home()?;
 
+    let mut fetch_error = None;
     let mut data = if cli.force_refresh {
         None
     } else {
@@ -961,21 +1024,25 @@ fn run_show(cli: Cli) -> Result<String, String> {
                     }
                     data = Some(d);
                 }
-                Err(_) => {
-                    data = load_cache(false, cli.cache_ttl);
+                Err(e) => {
+                    fetch_error = Some(e);
                 }
             }
         } else {
-            data = fetch_with_lock(&token, cli.cache_ttl, cli.http_timeout);
+            match fetch_with_lock(&token, cli.cache_ttl, cli.http_timeout) {
+                Ok(cache) => data = cache,
+                Err(e) => fetch_error = Some(e),
+            }
         }
         token.zeroize();
-
-        if data.is_none() {
-            data = load_cache(false, cli.cache_ttl);
-        }
     }
 
-    let data = data.ok_or_else(|| "no data".to_string())?;
+    let stale_cache = if data.is_none() {
+        load_cache(false, cli.cache_ttl)
+    } else {
+        None
+    };
+    let data = finalize_show_data(data, stale_cache, fetch_error)?;
     let now_ts = now();
     let rendered = match cli.output_mode {
         OutputMode::Tmux => format_tmux(&data, now_ts, cli.cache_ttl, cli.show_reset_dates),
@@ -1560,6 +1627,58 @@ mod tests {
         assert_eq!(show_error_exit_code(OutputMode::Tmux), 0);
         assert_eq!(show_error_exit_code(OutputMode::Ansi), 1);
         assert_eq!(show_error_exit_code(OutputMode::Json), 1);
+    }
+
+    #[test]
+    fn tmux_error_labels_are_classified_by_cause() {
+        assert_eq!(format_tmux_error("no token"), "[no-token]");
+        assert_eq!(
+            format_tmux_error("token expired — run: claude-rate-limit extract-token"),
+            "[expired]"
+        );
+        assert_eq!(
+            format_tmux_error(
+                "missing rate-limit header: anthropic-ratelimit-unified-5h-utilization"
+            ),
+            "[headers]"
+        );
+        assert_eq!(
+            format_tmux_error("transport error: connection failed"),
+            "[network]"
+        );
+        assert_eq!(format_tmux_error("request timed out"), "[timeout]");
+    }
+
+    #[test]
+    fn finalize_show_data_prefers_stale_cache_over_fetch_error() {
+        let stale = Cache {
+            fetched_at: 1000.0,
+            util_5h: 0.23,
+            util_1w: 0.6,
+            reset_5h: 2000,
+            reset_1w: 3000,
+        };
+
+        let result = finalize_show_data(
+            None,
+            Some(stale.clone()),
+            Some("token expired — run: claude-rate-limit extract-token".into()),
+        )
+        .unwrap();
+
+        assert_eq!(result, stale);
+    }
+
+    #[test]
+    fn finalize_show_data_preserves_fetch_error_when_no_cache_exists() {
+        let err = finalize_show_data(
+            None,
+            None,
+            Some("missing rate-limit header: anthropic-ratelimit-unified-5h-utilization".into()),
+        )
+        .unwrap_err();
+
+        assert!(err.starts_with("missing rate-limit header:"));
     }
 
     // === json output ===

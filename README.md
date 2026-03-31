@@ -136,6 +136,7 @@ Concurrent calls are coordinated with `flock` — one process makes the API call
 
 If display mode shows `[err]`, or `--json` returns an error object, check the cause first:
 
+- In `tmux` mode, short error tags may appear instead of plain `[err]`, such as `[no-token]`, `[expired]`, `[headers]`, `[network]`, or `[timeout]`.
 - If the error indicates token expiry or `401`, rerun `claude-rate-limit extract-token`.
 - If `~/.claude/.credentials.json` already exists and still works, you do not need to rerun `extract-token`.
 - Errors such as missing `HOME`, missing token file, network failure, or missing rate-limit headers require fixing the environment or retrying later.

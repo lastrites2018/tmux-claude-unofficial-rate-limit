@@ -136,6 +136,7 @@ tmux source-file ~/.tmux.conf
 
 표시 모드에서 `[err]`가 보이거나 `--json`이 에러 객체를 반환하면 원인을 먼저 확인하세요:
 
+- `tmux` 모드에서는 단순 `[err]` 대신 `[no-token]`, `[expired]`, `[headers]`, `[network]`, `[timeout]` 같은 짧은 에러 태그가 보일 수 있습니다.
 - 에러가 토큰 만료 또는 `401`을 가리키면 `claude-rate-limit extract-token`을 다시 실행하세요.
 - `~/.claude/.credentials.json`이 이미 있고 정상이라면 `extract-token`을 다시 실행할 필요는 없습니다.
 - `HOME` 미설정, 토큰 파일 없음, 네트워크 실패, rate-limit 헤더 누락 같은 경우는 환경을 고치거나 나중에 다시 시도해야 합니다.
